@@ -31,12 +31,24 @@ CosyVoice3 加速 voice-clone 推理：vLLM + DSpark 投机解码（LLM）+ Flas
         --paraformer-dir models/sherpa-onnx-paraformer-zh-2023-09-14
 
 ## 基准（H100，yuekai/seed_tts_zh_cosy3 test_zh 200 条，bs16）
+
+复现命令：
+
+    python examples/offline_inference.py --dataset yuekai/seed_tts_zh_cosy3 \
+        --split test_zh --limit 200 --batch-size 16 --output-dir results/bench_dspark
+    python examples/offline_inference.py --dataset yuekai/seed_tts_zh_cosy3 \
+        --split test_zh --limit 200 --batch-size 16 --draft-model none \
+        --output-dir results/bench_baseline
+
 | 配置 | llm tok/s | 平均接受长度 | 端到端 RTF |
 |---|---|---|---|
 | dspark | 9387.6 | 2.992 | 0.0110 |
 | baseline（无 draft） | 2057.5 | — | 0.0203 |
 
-llm 加速比 4.56x（0.5B 模型 bs16 下 per-step 开销占主导，投机解码减少步数收益超过接受长度本身）。
+llm 加速比 4.56x。注意：SpeechSpec 参考值为 bs16 下 1.70x（全量 2020 条）。本仓数字更高的可能原因：
+仅 200 条（continuous batching 尾部效应不同）、0.5B 模型 bs16 下 per-step 开销占主导使步数减少收益
+放大、计时口径差异（本仓只计 llm.generate 墙钟）。接受长度 2.992 与参考值 2.98 一致，说明投机
+解码行为本身对齐。
 RTF 为 (llm+t2w)/音频时长，不含 frontend。
 
 M1 = offline；M2 streaming server / M3 flashinfer 流式见设计文档里程碑。
