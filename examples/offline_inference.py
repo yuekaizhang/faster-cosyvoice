@@ -91,6 +91,9 @@ def load_items(args):
 
 
 def main():
+    # vLLM EngineCore fork 后 OpenMP 初始化会在 --estimator torch 路径 segfault
+    # (gomp_team_start)；OMP_NUM_THREADS=1 已验证可解，setdefault 保留用户覆盖。
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
     args = get_args()
     draft = None if args.draft_model in (None, "none") else args.draft_model
     llm_cfg = LLMConfig(target_model=args.target_model, draft_model=draft)
