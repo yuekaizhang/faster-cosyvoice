@@ -9,7 +9,8 @@ def test_llm_defaults_match_spec_appendix_a():
     assert (c.temperature, c.top_p, c.top_k) == (0.8, 0.95, 15)
     assert c.repetition_penalty == 1.1
     assert c.max_tokens == 2048
-    assert c.gpu_memory_utilization == 0.8
+    # 0.6：dspark draft KV/graphs 不计入 vLLM 配额 + token2wav 同卡，0.8 会 OOM
+    assert c.gpu_memory_utilization == 0.6
 
 
 def test_token2wav_defaults():

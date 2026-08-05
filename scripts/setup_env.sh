@@ -28,6 +28,14 @@ if [ ! -e "$SPEC_VLLM_DIR/vllm/__init__.py" ]; then
   mv "$SPEC_VLLM_DIR.tmp" "$SPEC_VLLM_DIR"
 fi
 find "$V025_SITE/vllm" -maxdepth 1 -name "*.so" -exec ln -sf {} "$SPEC_VLLM_DIR/vllm/" \;
+# vllm_flash_attn 子包的编译扩展与二进制子目录也需软链（top-level find 覆盖不到，
+# 否则模型 registry 检查报 "vllm.vllm_flash_attn requires _vllm_fa2_C or _vllm_fa3_C"）
+FA_DIR="$SPEC_VLLM_DIR/vllm/vllm_flash_attn"
+for item in _vllm_fa2_C.abi3.so _vllm_fa3_C.abi3.so cute layers ops; do
+  if [ -e "$V025_SITE/vllm/vllm_flash_attn/$item" ]; then
+    ln -sfn "$V025_SITE/vllm/vllm_flash_attn/$item" "$FA_DIR/$item"
+  fi
+done
 # _version.py 由构建生成，fork 源码树里没有；同样从 wheel 软链（同用户本地镜像的做法）
 ln -sf "$V025_SITE/vllm/_version.py" "$SPEC_VLLM_DIR/vllm/_version.py"
 

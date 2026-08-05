@@ -11,7 +11,9 @@ class LLMConfig:
     method: Optional[str] = None            # None → 从 draft config.json 自动
     num_spec_tokens: Optional[int] = None   # None → block_size - 1
     draft_sample_method: str = "probabilistic"
-    gpu_memory_utilization: float = 0.8     # offline 默认；server(M2) 用 0.5
+    # offline 默认 0.6：dspark draft 的 KV/graphs (~12GB) 不计入 vLLM 配额，
+    # 且 token2wav/frontend 同卡常驻；0.8 会 OOM (80GB H100)。server(M2) 用 0.5
+    gpu_memory_utilization: float = 0.6
     max_model_len: int = 4096
     # CV3 官方采样参数（spec 附录 A；rp=1.0 会跑飞）
     temperature: float = 0.8
