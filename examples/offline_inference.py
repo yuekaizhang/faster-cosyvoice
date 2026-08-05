@@ -52,6 +52,8 @@ def get_args():
     p.add_argument("--estimator", default="flashinfer",
                    choices=["flashinfer", "torch"])
     p.add_argument("--token2wav-batch-size", type=int, default=8)
+    p.add_argument("--token2wav-device", default="cuda:0",
+                   help="token2wav/frontend 所在设备（spec D6：可与 LLM 分卡）")
     p.add_argument("--output-dir", default="results/offline")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -101,6 +103,7 @@ def main():
     draft = None if args.draft_model in (None, "none") else args.draft_model
     llm_cfg = LLMConfig(target_model=args.target_model, draft_model=draft)
     t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
+                              device=args.token2wav_device,
                               estimator_mode=args.estimator,
                               batch_size=args.token2wav_batch_size)
 
