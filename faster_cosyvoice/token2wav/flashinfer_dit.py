@@ -1,0 +1,826 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""FlashInfer-accelerated CosyVoice3 DiT flow-matching estimator.
+
+Drop-in replacement for cosyvoice.flow.DiT.dit.DiT (offline path): state-dict
+compatible, loads flow.pt weights unchanged, swaps in as
+flow.decoder.estimator (the nn.Module branch of forward_estimator).
+
+Optimizations:
+- attention: SDPA + (b,n,n) materialized mask -> flashinfer ragged prefill
+  (2 CFG documents, no mask); the partial x_transformers RoPE (first 64 of
+  1024 channels) is exactly "rotate head 0 only" in NHD layout.
+- adaLN: the modulate "+1" folded into the adaLN linear bias; every
+  modulate / gated-residual collapses to one addcmul.
+- qkv fused into one GEMM.
+- optional CUDA graphs: per-shape, or duration-bucketed (both CFG docs share
+  one length, so bucketed attention is a single SDPA call with a runtime
+  key-padding mask).
+
+Usage:
+    from token2wav_cosyvoice3_flashinfer import apply_flashinfer
+    model = CosyVoice3_Token2Wav(model_dir, enable_trt=False)
+    apply_flashinfer(model, enable_cuda_graph=True)
+"""
+import math
+from typing import List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import flashinfer
+
+from x_transformers.x_transformers import RotaryEmbedding
+from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.dit import InputEmbedding
+from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.modules import (
+    TimestepEmbedding,
+    DiTBlock,
+    AdaLayerNormZero_Final,
+)
+
+_WORKSPACE_SIZE = 64 * 1024 * 1024
+_ROPE_MAX_LEN = 4096
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _ln_modulate_kernel(X, SHIFT, SCALE, OUT, n_per_batch, mod_stride,
+                            eps: tl.constexpr, D: tl.constexpr):
+        """out = LayerNorm(x, no affine) * scale + shift, one row per program.
+        X/OUT: (rows, D) contiguous; SHIFT/SCALE: strided views, one row per
+        batch element (row // n_per_batch), inner dim contiguous."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        x = tl.load(X + row * D + cols).to(tl.float32)
+        mean = tl.sum(x) / D
+        xc = x - mean
+        rstd = 1.0 / tl.sqrt(tl.sum(xc * xc) / D + eps)
+        y = xc * rstd
+        b = row // n_per_batch
+        sh = tl.load(SHIFT + b * mod_stride + cols).to(tl.float32)
+        sc = tl.load(SCALE + b * mod_stride + cols).to(tl.float32)
+        tl.store(OUT + row * D + cols, (y * sc + sh).to(OUT.dtype.element_ty))
+
+    @triton.jit
+    def _qkv_rope_repack_kernel(QKV, Q, K, V, COS, SIN, n_per_batch,
+                                D: tl.constexpr):
+        """One kernel per row: split the fused-qkv GEMM output into packed
+        q/k/v (replacing three .contiguous() copies) and rotate head 0 of
+        q/k in place (x_transformers partial rope, interleaved pairs)."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        base = row * 3 * D
+        q = tl.load(QKV + base + cols).to(tl.float32)
+        k = tl.load(QKV + base + D + cols).to(tl.float32)
+        v = tl.load(QKV + base + 2 * D + cols)
+
+        is_h0 = cols < 64
+        pos = row % n_per_batch
+        pair = cols // 2
+        cos = tl.load(COS + pos * 32 + pair, mask=is_h0, other=1.0)
+        sin = tl.load(SIN + pos * 32 + pair, mask=is_h0, other=0.0)
+        partner = tl.where(cols % 2 == 0, cols + 1, cols - 1)
+        sign = tl.where(cols % 2 == 0, -1.0, 1.0)
+        qp = tl.load(QKV + base + partner, mask=is_h0, other=0.0).to(tl.float32)
+        kp = tl.load(QKV + base + D + partner, mask=is_h0, other=0.0).to(tl.float32)
+        q = tl.where(is_h0, q * cos + sign * qp * sin, q)
+        k = tl.where(is_h0, k * cos + sign * kp * sin, k)
+
+        tl.store(Q + row * D + cols, q.to(Q.dtype.element_ty))
+        tl.store(K + row * D + cols, k.to(K.dtype.element_ty))
+        tl.store(V + row * D + cols, v)
+
+    @triton.jit
+    def _gate_ln_modulate_kernel(H, GATE, Y, SHIFT, SCALE, H_OUT, NORM_OUT,
+                                 n_per_batch, mod_stride,
+                                 eps: tl.constexpr, D: tl.constexpr):
+        """h_out = h + gate * y; norm_out = LayerNorm(h_out) * scale + shift.
+        Fuses the gated residual into the next norm+modulate (two stores)."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        b = row // n_per_batch
+        h = tl.load(H + row * D + cols).to(tl.float32)
+        g = tl.load(GATE + b * mod_stride + cols).to(tl.float32)
+        y = tl.load(Y + row * D + cols).to(tl.float32)
+        h = h + g * y
+        tl.store(H_OUT + row * D + cols, h.to(H_OUT.dtype.element_ty))
+        mean = tl.sum(h) / D
+        hc = h - mean
+        rstd = 1.0 / tl.sqrt(tl.sum(hc * hc) / D + eps)
+        sh = tl.load(SHIFT + b * mod_stride + cols).to(tl.float32)
+        sc = tl.load(SCALE + b * mod_stride + cols).to(tl.float32)
+        tl.store(NORM_OUT + row * D + cols,
+                 (hc * rstd * sc + sh).to(NORM_OUT.dtype.element_ty))
+
+    @triton.jit
+    def _ln_modulate_packed_kernel(X, SHIFT, SCALE, OUT, DOC, mod_stride,
+                                   eps: tl.constexpr, D: tl.constexpr):
+        """Packed-layout variant: per-row document id instead of row//n."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        x = tl.load(X + row * D + cols).to(tl.float32)
+        mean = tl.sum(x) / D
+        xc = x - mean
+        rstd = 1.0 / tl.sqrt(tl.sum(xc * xc) / D + eps)
+        b = tl.load(DOC + row)
+        sh = tl.load(SHIFT + b * mod_stride + cols).to(tl.float32)
+        sc = tl.load(SCALE + b * mod_stride + cols).to(tl.float32)
+        tl.store(OUT + row * D + cols,
+                 (xc * rstd * sc + sh).to(OUT.dtype.element_ty))
+
+    @triton.jit
+    def _gate_ln_modulate_packed_kernel(H, GATE, Y, SHIFT, SCALE, H_OUT,
+                                        NORM_OUT, DOC, mod_stride,
+                                        eps: tl.constexpr, D: tl.constexpr):
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        b = tl.load(DOC + row)
+        h = tl.load(H + row * D + cols).to(tl.float32)
+        g = tl.load(GATE + b * mod_stride + cols).to(tl.float32)
+        y = tl.load(Y + row * D + cols).to(tl.float32)
+        h = h + g * y
+        tl.store(H_OUT + row * D + cols, h.to(H_OUT.dtype.element_ty))
+        mean = tl.sum(h) / D
+        hc = h - mean
+        rstd = 1.0 / tl.sqrt(tl.sum(hc * hc) / D + eps)
+        sh = tl.load(SHIFT + b * mod_stride + cols).to(tl.float32)
+        sc = tl.load(SCALE + b * mod_stride + cols).to(tl.float32)
+        tl.store(NORM_OUT + row * D + cols,
+                 (hc * rstd * sc + sh).to(NORM_OUT.dtype.element_ty))
+
+    @triton.jit
+    def _qkv_rope_repack_packed_kernel(QKV, Q, K, V, COS, SIN, POS,
+                                       D: tl.constexpr):
+        """Packed variant: per-row rope position from POS (restarts per doc)."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, D)
+        base = row * 3 * D
+        q = tl.load(QKV + base + cols).to(tl.float32)
+        k = tl.load(QKV + base + D + cols).to(tl.float32)
+        v = tl.load(QKV + base + 2 * D + cols)
+
+        is_h0 = cols < 64
+        pos = tl.load(POS + row)
+        pair = cols // 2
+        cos = tl.load(COS + pos * 32 + pair, mask=is_h0, other=1.0)
+        sin = tl.load(SIN + pos * 32 + pair, mask=is_h0, other=0.0)
+        partner = tl.where(cols % 2 == 0, cols + 1, cols - 1)
+        sign = tl.where(cols % 2 == 0, -1.0, 1.0)
+        qp = tl.load(QKV + base + partner, mask=is_h0, other=0.0).to(tl.float32)
+        kp = tl.load(QKV + base + D + partner, mask=is_h0, other=0.0).to(tl.float32)
+        q = tl.where(is_h0, q * cos + sign * qp * sin, q)
+        k = tl.where(is_h0, k * cos + sign * kp * sin, k)
+
+        tl.store(Q + row * D + cols, q.to(Q.dtype.element_ty))
+        tl.store(K + row * D + cols, k.to(K.dtype.element_ty))
+        tl.store(V + row * D + cols, v)
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover
+    _HAS_TRITON = False
+
+
+def _ln_modulate_triton(x, shift, scale, eps=1e-6):
+    """Fused LayerNorm(elementwise_affine=False) + modulate (one kernel).
+    Saves kernels + memory passes, but triton's Python launcher costs
+    30-60us of host time per call — a win only inside CUDA graphs.
+    x: (b, n, D) contiguous; shift/scale: (b, 1, D) views with contiguous
+    inner dim (slices of the fused adaLN output)."""
+    b, n, d = x.shape
+    out = torch.empty_like(x)
+    _ln_modulate_kernel[(b * n,)](
+        x, shift, scale, out, n, shift.stride(0), eps, d)
+    return out
+
+
+def _ln_modulate_torch(x, shift, scale, eps=1e-6):
+    return torch.addcmul(shift, F.layer_norm(x, (x.shape[-1],), eps=eps), scale)
+
+
+def _gate_ln_modulate(h, gate, y, shift, scale, eps=1e-6):
+    """h_out = h + gate*y; norm_out = LN(h_out)*scale + shift (one kernel)."""
+    b, n, d = h.shape
+    h_out = torch.empty_like(h)
+    norm_out = torch.empty_like(h)
+    _gate_ln_modulate_kernel[(b * n,)](
+        h, gate, y, shift, scale, h_out, norm_out, n, gate.stride(0), eps, d)
+    return h_out, norm_out
+
+
+class RaggedAttentionRunner:
+    def __init__(self, num_heads, head_dim, device, workspace_size=_WORKSPACE_SIZE):
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.device = device
+        self._workspace = torch.zeros(workspace_size, dtype=torch.uint8, device=device)
+        self.wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            self._workspace, "NHD"
+        )
+        self._planned_key = None
+
+    def plan(self, batch_size: int, seq_len: int, dtype: torch.dtype):
+        key = (batch_size, seq_len, dtype)
+        if key == self._planned_key:
+            return
+        indptr = torch.arange(0, (batch_size + 1) * seq_len, seq_len,
+                              dtype=torch.int32, device=self.device)
+        self.wrapper.plan(
+            indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
+            causal=False, sm_scale=self.head_dim ** -0.5,
+            q_data_type=dtype, kv_data_type=dtype,
+        )
+        self._planned_key = key
+
+    def plan_docs(self, doc_lens: List[int], dtype: torch.dtype):
+        """Plan for variable-length packed documents."""
+        key = (tuple(doc_lens), dtype)
+        if key == self._planned_key:
+            return
+        indptr = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=self.device)
+        indptr[1:] = torch.cumsum(
+            torch.tensor(doc_lens, dtype=torch.int32, device=self.device), dim=0)
+        self.wrapper.plan(
+            indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
+            causal=False, sm_scale=self.head_dim ** -0.5,
+            q_data_type=dtype, kv_data_type=dtype,
+        )
+        self._planned_key = key
+
+
+def _rotate_half_interleaved(x):
+    # x_transformers rotate_half: interleaved pairs (GPT-NeoX style)
+    x = x.unflatten(-1, (-1, 2))
+    x1, x2 = x.unbind(-1)
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+class FlashInferDiT(nn.Module):
+    """State-dict compatible rewrite of cosyvoice.flow.DiT.dit.DiT (offline)."""
+
+    def __init__(self, dim=1024, depth=22, heads=16, dim_head=64, ff_mult=2,
+                 mel_dim=80, mu_dim=80, spk_dim=80, out_channels=80,
+                 enable_cuda_graph=False, cuda_graph_buckets=None,
+                 device="cuda:0"):
+        super().__init__()
+        self.dim = dim
+        self.depth = depth
+        self.heads = heads
+        self.dim_head = dim_head
+        self.out_channels = out_channels
+        self.enable_cuda_graph = enable_cuda_graph
+        # mel frames (50 fps); buckets given in audio seconds
+        self.cuda_graph_buckets = (
+            sorted(int(d * 50) for d in cuda_graph_buckets) if cuda_graph_buckets else None
+        )
+
+        self.time_embed = TimestepEmbedding(dim)
+        self.input_embed = InputEmbedding(mel_dim, mu_dim, dim, spk_dim)
+        self.rotary_embed = RotaryEmbedding(dim_head)
+        self.transformer_blocks = nn.ModuleList(
+            [DiTBlock(dim=dim, heads=heads, dim_head=dim_head, ff_mult=ff_mult, dropout=0.1)
+             for _ in range(depth)]
+        )
+        self.norm_out = AdaLayerNormZero_Final(dim)
+        self.proj_out = nn.Linear(dim, mel_dim)
+
+        self.attn_runner = RaggedAttentionRunner(heads, dim_head, torch.device(device))
+        self._graph_cache = {}
+        self._pack_cache = {}
+        self._finalized = False
+        # triton fusion only pays off when its launcher overhead is hidden by
+        # graph replay; eager mode keeps the native-kernel path
+        self._fused_tail = enable_cuda_graph and _HAS_TRITON
+        self._ln_mod = (_ln_modulate_triton if self._fused_tail
+                        else _ln_modulate_torch)
+
+    def finalize_weights(self):
+        """Derive fused inference weights; call once after load + cast."""
+        assert not self._finalized
+        self._finalized = True
+        for block in self.transformer_blocks:
+            attn = block.attn
+            attn._fi_w_qkv = torch.cat(
+                [attn.to_q.weight, attn.to_k.weight, attn.to_v.weight], dim=0)
+            attn._fi_b_qkv = torch.cat(
+                [attn.to_q.bias, attn.to_k.bias, attn.to_v.bias], dim=0)
+            # fold modulate's "+1" into the adaLN bias: chunk order is
+            # (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+            bias = block.attn_norm.linear.bias.data.view(6, self.dim)
+            bias[1] += 1.0
+            bias[4] += 1.0
+        # AdaLayerNormZero_Final chunk order is (scale, shift)
+        self.norm_out.linear.bias.data.view(2, self.dim)[0] += 1.0
+
+        # partial-RoPE tables (x_transformers semantics, fp32 math). The
+        # interleaved-pair rotation is exactly a complex multiply:
+        # (a+bi)(cos+isin) -> even' = a cos - b sin, odd' = b cos + a sin.
+        with torch.autocast(device_type="cuda", enabled=False):
+            freqs, _ = self.rotary_embed.forward_from_seq_len(_ROPE_MAX_LEN)
+        freqs = freqs.reshape(-1, self.dim_head).float()
+        self._rope_cos = freqs.cos()  # (L, 64), kept for the reference path
+        self._rope_sin = freqs.sin()
+        theta = freqs[:, 0::2]  # de-interleave: theta_i repeated pairwise
+        self._rope_cis = torch.polar(torch.ones_like(theta), theta)  # (L, 32) c64
+        self._rope_cos32 = theta.cos().contiguous()  # (L, 32) for the triton kernel
+        self._rope_sin32 = theta.sin().contiguous()
+
+        # one GEMM for every block's adaLN (+ the final one): t_emb is shared,
+        # so 23 tiny per-block GEMMs collapse into a single fused projection
+        # whose outputs are consumed as zero-cost slices.
+        ada_w = [blk.attn_norm.linear.weight for blk in self.transformer_blocks]
+        ada_b = [blk.attn_norm.linear.bias for blk in self.transformer_blocks]
+        self._ada_w = torch.cat(ada_w + [self.norm_out.linear.weight], dim=0)
+        self._ada_b = torch.cat(ada_b + [self.norm_out.linear.bias], dim=0)
+
+        # conv position embedding as im2col + bmm: ~1.4x faster than cudnn's
+        # grouped-conv kernel at these shapes and avoids its NCHW<->NHWC
+        # layout conversions. weight (C, C/G, K) -> (G, C/G_out, K*C/G_in),
+        # matching the unfolded (tap, cin) window layout.
+        self._conv_pos = []
+        cpe = self.input_embed.conv_pos_embed
+        for seq in (cpe.conv1, cpe.conv2):
+            conv = seq[0]
+            g = conv.groups
+            cg = conv.out_channels // g
+            k = conv.kernel_size[0]
+            w = conv.weight.view(g, cg, cg, k).permute(0, 1, 3, 2).reshape(g, cg, k * cg)
+            self._conv_pos.append((w.transpose(1, 2).contiguous(), conv.bias, g, cg, k))
+
+    # ------------------------------------------------------------------
+    def forward(self, x, mask, mu, t, spks=None, cond=None, streaming=False):
+        assert not streaming, "flashinfer estimator supports the offline path only"
+        # run in pure fp16 regardless of the caller's autocast (like the TRT engine)
+        with torch.autocast(device_type="cuda", enabled=False):
+            dtype = self.proj_out.weight.dtype
+            x, mu, spks, cond, t = (
+                x.to(dtype), mu.to(dtype), spks.to(dtype), cond.to(dtype), t.to(dtype))
+
+            b, _, seq_len = x.shape
+            if self.enable_cuda_graph and b == 2:
+                if self.cuda_graph_buckets is not None:
+                    return self._forward_graph_bucketed(x, mu, t, spks, cond)
+                return self._forward_graph(x, mu, t, spks, cond)
+            if _HAS_TRITON:
+                # packed varlen path: fastest no-graph route even at b=2
+                # (single-sample CFG) — fused triton kernels amortize their
+                # launcher cost over far fewer total launches
+                return self._forward_packed(x, mask, mu, t, spks, cond)
+
+            self.attn_runner.plan(b, seq_len, dtype)
+            return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
+
+    def _forward_packed(self, x, mask, mu, t, spks, cond):
+        """Batch>1 path: padded (2B, 80, maxT) rows are packed into one
+        varlen sequence (total real tokens) for the transformer stack —
+        zero padding compute, exact ragged attention per document."""
+        assert _HAS_TRITON, "packed batch mode requires triton"
+        b, _, maxT = x.shape
+        n_dim = self.dim
+        lens_t = mask[:, 0].sum(-1).to(torch.int64)
+        lens = [int(v) for v in lens_t.tolist()]
+        key = (b, maxT, tuple(lens))
+        meta = self._pack_cache.get(key)
+        if meta is None:
+            device = x.device
+            pack_idx = torch.cat([
+                torch.arange(r * maxT, r * maxT + l, device=device)
+                for r, l in enumerate(lens)])
+            doc_ids = torch.repeat_interleave(
+                torch.arange(b, device=device, dtype=torch.int32), lens_t.to(device))
+            pos_ids = torch.cat([
+                torch.arange(l, device=device, dtype=torch.int32) for l in lens])
+            meta = {"pack_idx": pack_idx, "doc_ids": doc_ids, "pos_ids": pos_ids,
+                    "lens": lens}
+            self._pack_cache[key] = meta
+        self.attn_runner.plan_docs(meta["lens"], x.dtype)
+
+        # input embedding on the padded layout (cheap; causal conv is
+        # pad-safe since padding sits at the tail of each row)
+        xT, muT, condT = x.transpose(1, 2), mu.transpose(1, 2), cond.transpose(1, 2)
+        spks_rep = spks.unsqueeze(1).expand(-1, maxT, -1)
+        h0 = self.input_embed.proj(torch.cat([xT, condT, muT, spks_rep], dim=-1))
+        h = self._conv_pos_forward(h0) + h0
+
+        # pack: (2B, maxT, dim) -> (total, dim)
+        hp = h.reshape(b * maxT, n_dim).index_select(0, meta["pack_idx"])
+        total = hp.shape[0]
+        doc_ids, pos_ids = meta["doc_ids"], meta["pos_ids"]
+
+        t_emb = self.time_embed(t)  # (2B, dim)
+        ada = F.linear(F.silu(t_emb), self._ada_w, self._ada_b)  # (2B, W)
+        six = 6 * n_dim
+        mods = [ada[:, i * six:(i + 1) * six].chunk(6, dim=-1)
+                for i in range(self.depth)]
+        fscale, fshift = ada[:, self.depth * six:].chunk(2, dim=-1)
+        stride = ada.stride(0)
+        eps = 1e-6
+
+        def ln_mod(hh, shift, scale):
+            out = torch.empty_like(hh)
+            _ln_modulate_packed_kernel[(total,)](
+                hh, shift, scale, out, doc_ids, stride, eps, n_dim)
+            return out
+
+        def gate_ln(hh, gate, y, shift, scale):
+            h_out = torch.empty_like(hh)
+            norm_out = torch.empty_like(hh)
+            _gate_ln_modulate_packed_kernel[(total,)](
+                hh, gate, y, shift, scale, h_out, norm_out, doc_ids, stride,
+                eps, n_dim)
+            return h_out, norm_out
+
+        norm = ln_mod(hp, mods[0][0], mods[0][1])
+        for i, block in enumerate(self.transformer_blocks):
+            _, _, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods[i]
+            attn = block.attn
+            qkv = F.linear(norm, attn._fi_w_qkv, attn._fi_b_qkv)  # (total, 3d)
+            q = torch.empty(total, self.heads, self.dim_head,
+                            dtype=qkv.dtype, device=qkv.device)
+            k = torch.empty_like(q)
+            v = torch.empty_like(q)
+            _qkv_rope_repack_packed_kernel[(total,)](
+                qkv, q, k, v, self._rope_cos32, self._rope_sin32, pos_ids, n_dim)
+            attn_out = attn.to_out[0](
+                self.attn_runner.wrapper.run(q, k, v).reshape(total, n_dim))
+            hp, ffn_in = gate_ln(hp, gate_msa, attn_out, shift_mlp, scale_mlp)
+            ff_out = block.ff(ffn_in)
+            if i + 1 < self.depth:
+                hp, norm = gate_ln(hp, gate_mlp, ff_out, mods[i + 1][0], mods[i + 1][1])
+            else:
+                _, norm = gate_ln(hp, gate_mlp, ff_out, fshift, fscale)
+
+        y = self.proj_out(norm)  # (total, 80)
+        out = torch.zeros(b * maxT, y.shape[-1], dtype=y.dtype, device=y.device)
+        out.index_copy_(0, meta["pack_idx"], y)
+        return out.view(b, maxT, -1).transpose(1, 2)
+
+    def _apply_rope_head0(self, x_bnhd, cis):
+        """x_transformers partial rope == rotate only head 0 in NHD layout.
+        x_bnhd: (b, n, H, D); cis: (n, D/2) complex64, broadcast over batch."""
+        b, n = x_bnhd.shape[:2]
+        x0 = torch.view_as_complex(
+            x_bnhd[:, :, 0].float().reshape(b, n, self.dim_head // 2, 2))
+        x_bnhd[:, :, 0] = torch.view_as_real(x0 * cis).flatten(-2).to(x_bnhd.dtype)
+
+    def _attention(self, attn, x, cis, runner, pad_mask=None):
+        b, n, _ = x.shape
+        qkv = F.linear(x, attn._fi_w_qkv, attn._fi_b_qkv)  # (b, n, 3*dim)
+        if self._fused_tail:
+            # one triton kernel: split qkv into packed q/k/v AND rotate head 0
+            # (replaces 3 .contiguous() copies + the rope cast/mul chain)
+            rows = b * n
+            q = torch.empty(rows, self.heads, self.dim_head,
+                            dtype=qkv.dtype, device=qkv.device)
+            k = torch.empty_like(q)
+            v = torch.empty_like(q)
+            _qkv_rope_repack_kernel[(rows,)](
+                qkv.view(rows, 3 * self.dim), q, k, v,
+                self._rope_cos32, self._rope_sin32, n, self.dim)
+            if runner is not None:
+                out = runner.wrapper.run(q, k, v)  # (b*n, H, D)
+            else:
+                out = F.scaled_dot_product_attention(
+                    q.view(b, n, self.heads, self.dim_head).transpose(1, 2),
+                    k.view(b, n, self.heads, self.dim_head).transpose(1, 2),
+                    v.view(b, n, self.heads, self.dim_head).transpose(1, 2),
+                    attn_mask=pad_mask)
+                out = out.transpose(1, 2)
+            return attn.to_out[0](out.reshape(b, n, self.dim))
+
+        # rope folded into the packing copy we must pay anyway: rotate the
+        # head-0 slice (complex multiply) and cat with the untouched tail —
+        # cat emits the densely packed tensor directly, replacing the
+        # index_put + .contiguous() chain (4 kernels/tensor instead of 6).
+        q, k, v = qkv.chunk(3, dim=-1)  # (b, n, dim) strided views
+
+        def rope_pack(x):
+            x0 = torch.view_as_complex(x[..., :64].float().reshape(b, n, 32, 2))
+            x0 = torch.view_as_real(x0 * cis).flatten(-2).to(x.dtype)
+            return torch.cat([x0, x[..., 64:]], dim=-1)
+
+        q = rope_pack(q)
+        k = rope_pack(k)
+        if runner is not None:
+            out = runner.wrapper.run(
+                q.view(b * n, self.heads, self.dim_head),
+                k.view(b * n, self.heads, self.dim_head),
+                v.reshape(b * n, self.heads, self.dim_head).contiguous(),
+            )  # (b*n, H, D)
+        else:
+            # bucketed-graph path: both CFG docs share one real length, so a
+            # single SDPA with a runtime-updated key-padding mask is exact
+            out = F.scaled_dot_product_attention(
+                q.view(b, n, self.heads, self.dim_head).transpose(1, 2),
+                k.view(b, n, self.heads, self.dim_head).transpose(1, 2),
+                v.reshape(b, n, self.heads, self.dim_head).transpose(1, 2),
+                attn_mask=pad_mask)
+            out = out.transpose(1, 2)
+        return attn.to_out[0](out.reshape(b, n, self.dim))
+
+    def _conv_pos_forward(self, h):
+        """CausalConvPositionEmbedding via im2col + bmm on (b, n, c)."""
+        b, n, c = h.shape
+        y = h
+        for w_t, bias, g, cg, k in self._conv_pos:
+            xp = F.pad(y.transpose(1, 2), (k - 1, 0))     # (b, c, n+k-1)
+            xu = (xp.view(b, g, cg, n + k - 1)
+                  .unfold(3, k, 1)                        # (b, g, cg, n, k)
+                  .permute(1, 0, 3, 4, 2)
+                  .reshape(g, b * n, k * cg))
+            y = torch.bmm(xu, w_t).view(g, b, n, cg).permute(1, 2, 0, 3).reshape(b, n, c)
+            y = F.mish(y + bias)
+        return y
+
+    def _forward_impl(self, x, mu, t, spks, cond, runner, pad_mask):
+        # x/mu/cond: (b, 80, n); t: (b,); spks: (b, 80)
+        xT = x.transpose(1, 2)
+        muT = mu.transpose(1, 2)
+        condT = cond.transpose(1, 2)
+        n = xT.shape[1]
+
+        t_emb = self.time_embed(t)  # (b, dim)
+        spks_rep = spks.unsqueeze(1).expand(-1, n, -1)
+        h0 = self.input_embed.proj(torch.cat([xT, condT, muT, spks_rep], dim=-1))
+        h = self._conv_pos_forward(h0) + h0
+
+        cis = self._rope_cis[:n]
+        # all 23 adaLN projections in one GEMM ("+1" already folded into bias)
+        ada = F.linear(F.silu(t_emb), self._ada_w, self._ada_b).unsqueeze(1)
+
+        six = 6 * self.dim
+        mods = [ada[:, :, i * six:(i + 1) * six].chunk(6, dim=-1)
+                for i in range(self.depth)]
+        fscale, fshift = ada[:, :, self.depth * six:].chunk(2, dim=-1)
+
+        if self._fused_tail:
+            # gated residuals fused into the NEXT norm+modulate (2 stores/kernel)
+            norm = self._ln_mod(h, mods[0][0], mods[0][1])
+            for i, block in enumerate(self.transformer_blocks):
+                _, _, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods[i]
+                attn_out = self._attention(block.attn, norm, cis, runner, pad_mask)
+                h, ffn_in = _gate_ln_modulate(h, gate_msa, attn_out, shift_mlp, scale_mlp)
+                ff_out = block.ff(ffn_in)
+                if i + 1 < self.depth:
+                    h, norm = _gate_ln_modulate(h, gate_mlp, ff_out,
+                                                mods[i + 1][0], mods[i + 1][1])
+                else:
+                    _, norm = _gate_ln_modulate(h, gate_mlp, ff_out, fshift, fscale)
+            return self.proj_out(norm).transpose(1, 2)
+
+        for i, block in enumerate(self.transformer_blocks):
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods[i]
+            norm = self._ln_mod(h, shift_msa, scale_msa)
+            attn_out = self._attention(block.attn, norm, cis, runner, pad_mask)
+            h = torch.addcmul(h, gate_msa, attn_out)
+            ffn_in = self._ln_mod(h, shift_mlp, scale_mlp)
+            h = torch.addcmul(h, gate_mlp, block.ff(ffn_in))
+
+        h = self._ln_mod(h, fshift, fscale)
+        return self.proj_out(h).transpose(1, 2)
+
+    # ------------------------------------------------------------------
+    def _forward_graph(self, x, mu, t, spks, cond):
+        key = (x.shape[0], x.shape[2])
+        entry = self._graph_cache.get(key)
+        if entry is None:
+            entry = self._capture(x.shape[0], x.shape[2], x.dtype, bucket=False)
+            self._graph_cache[key] = entry
+        return self._replay(entry, x, mu, t, spks, cond, x.shape[2])
+
+    def _forward_graph_bucketed(self, x, mu, t, spks, cond):
+        b, _, n = x.shape
+        bucket = next((s for s in self.cuda_graph_buckets if s >= n), None)
+        if bucket is None:  # longer than the largest bucket: eager fallback
+            self.attn_runner.plan(b, n, x.dtype)
+            return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
+        key = ("bucket", b, bucket)
+        entry = self._graph_cache.get(key)
+        if entry is None:
+            entry = self._capture(b, bucket, x.dtype, bucket=True)
+            self._graph_cache[key] = entry
+        entry["pad_mask"][..., :n] = True
+        entry["pad_mask"][..., n:] = False
+        return self._replay(entry, x, mu, t, spks, cond, n)
+
+    def _replay(self, entry, x, mu, t, spks, cond, n):
+        s = entry["x"]
+        s["x"][:, :, :n].copy_(x)
+        s["x"][:, :, n:].zero_()
+        s["mu"][:, :, :n].copy_(mu)
+        s["mu"][:, :, n:].zero_()
+        s["cond"][:, :, :n].copy_(cond)
+        s["cond"][:, :, n:].zero_()
+        s["t"].copy_(t)
+        s["spks"].copy_(spks)
+        entry["graph"].replay()
+        return entry["out"][:, :, :n]
+
+    def _capture(self, b, n, dtype, bucket):
+        device = self.proj_out.weight.device
+        static = {
+            "x": torch.zeros(b, 80, n, dtype=dtype, device=device),
+            "mu": torch.zeros(b, 80, n, dtype=dtype, device=device),
+            "cond": torch.zeros(b, 80, n, dtype=dtype, device=device),
+            "t": torch.zeros(b, dtype=dtype, device=device),
+            "spks": torch.zeros(b, 80, dtype=dtype, device=device),
+        }
+        if bucket:
+            runner = None
+            pad_mask = torch.ones(1, 1, 1, n, dtype=torch.bool, device=device)
+        else:
+            # each captured graph bakes its plan's launch metadata: private runner
+            runner = RaggedAttentionRunner(self.heads, self.dim_head, device)
+            runner.plan(b, n, dtype)
+            pad_mask = None
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self._forward_impl(static["x"], static["mu"], static["t"],
+                                   static["spks"], static["cond"], runner, pad_mask)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = self._forward_impl(static["x"], static["mu"], static["t"],
+                                     static["spks"], static["cond"], runner, pad_mask)
+        return {"graph": graph, "out": out, "x": static, "runner": runner,
+                "pad_mask": pad_mask}
+
+
+@torch.inference_mode()
+def _solve_euler_batched(decoder, z, mu, mask, spks, cond, n_timesteps=10):
+    """Batched CFG euler solver: the repo's solve_euler hardcodes batch=1
+    buffers, so multi-sample batches build the 2B-row CFG stack here."""
+    B = mu.shape[0]
+    t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=spks.dtype)
+    t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+    t, dt = t_span[0], t_span[1] - t_span[0]
+
+    mask_in = mask.repeat(2, 1, 1).to(spks.dtype)
+    mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0).to(spks.dtype)
+    spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
+    cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0).to(spks.dtype)
+    t_in = torch.zeros(2 * B, device=mu.device, dtype=spks.dtype)
+
+    x = z.to(spks.dtype)
+    for step in range(1, len(t_span)):
+        x_in = x.repeat(2, 1, 1)
+        t_in.fill_(t)
+        dphi_dt = decoder.forward_estimator(
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in, False)
+        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [B, B], dim=0)
+        dphi_dt = ((1.0 + decoder.inference_cfg_rate) * dphi_dt
+                   - decoder.inference_cfg_rate * cfg_dphi_dt)
+        x = x + dt * dphi_dt
+        t = t + dt
+        if step < len(t_span) - 1:
+            dt = t_span[step + 1] - t
+    return x
+
+
+@torch.inference_mode()
+def flow_inference_batched(flow, token_list, prompt_feat_list, embedding):
+    """Batched replica of CausalMaskedDiffWithDiT.inference (offline).
+
+    Args:
+        flow: the CausalMaskedDiffWithDiT module (fp16, flashinfer estimator).
+        token_list: per-sample [prompt_tokens + generated_tokens] (list of list[int]).
+        prompt_feat_list: per-sample prompt mel (1, L_i, 80).
+        embedding: (B, 192) speaker embeddings.
+    Returns:
+        list of per-sample generated mel (1, 80, mel_len2_i), fp32.
+    """
+    device = embedding.device
+    from faster_cosyvoice.token2wav.cosyvoice.utils.mask import make_pad_mask
+
+    embedding = embedding.to(next(flow.parameters()).dtype)
+    B = len(token_list)
+    token_lens = torch.tensor([len(tk) for tk in token_list], device=device)
+    max_tok = int(token_lens.max())
+    token = torch.zeros(B, max_tok, dtype=torch.long, device=device)
+    for i, tk in enumerate(token_list):
+        token[i, :len(tk)] = torch.tensor(tk, device=device)
+
+    embedding = F.normalize(embedding, dim=1)
+    embedding = flow.spk_embed_affine_layer(embedding)
+
+    mask = (~make_pad_mask(token_lens)).unsqueeze(-1).to(embedding)
+    token = flow.input_embedding(torch.clamp(token, min=0)) * mask
+    h = flow.pre_lookahead_layer(token)  # zero right-pad == batch pad: exact
+    h = h.repeat_interleave(flow.token_mel_ratio, dim=1)
+
+    mel_lens = token_lens * flow.token_mel_ratio
+    max_mel = int(mel_lens.max())
+    conds = torch.zeros(B, max_mel, flow.output_size, device=device, dtype=h.dtype)
+    mel_len1 = []
+    for i, pf in enumerate(prompt_feat_list):
+        l1 = pf.shape[1]
+        mel_len1.append(l1)
+        conds[i, :l1] = pf[0].to(h.dtype)
+    conds = conds.transpose(1, 2)
+
+    mel_mask = (~make_pad_mask(mel_lens, max_len=max_mel)).to(h)
+
+    z = torch.randn(B, flow.output_size, max_mel, device=device, dtype=h.dtype)
+    feat = _solve_euler_batched(
+        flow.decoder, z,
+        mu=h.transpose(1, 2).contiguous(),
+        mask=mel_mask.unsqueeze(1),
+        spks=embedding,
+        cond=conds,
+        n_timesteps=10,
+    )
+    return [feat[i:i + 1, :, mel_len1[i]:int(mel_lens[i])].float() for i in range(B)]
+
+
+@torch.inference_mode()
+def token2wav_forward_batched(model, generated_speech_tokens_list,
+                              prompt_audios_list, prompt_audios_sample_rate):
+    """Batched replica of CosyVoice3_Token2Wav.forward (offline): batched
+    flow with the packed flashinfer estimator, per-sample hift vocoder."""
+    assert all(sr == 16000 for sr in prompt_audios_sample_rate)
+    prompt_speech_tokens_list = model.prompt_audio_tokenization(prompt_audios_list)
+    prompt_mels, prompt_mels_lens = model.get_prompt_mels(
+        prompt_audios_list, prompt_audios_sample_rate)
+    spk_emb = model.get_spk_emb(prompt_audios_list).to(model.device)
+
+    token_list, prompt_feat_list = [], []
+    for i in range(len(generated_speech_tokens_list)):
+        tok_len = min(int(prompt_mels_lens[i].item() / 2),
+                      len(prompt_speech_tokens_list[i]))
+        prompt_tokens = prompt_speech_tokens_list[i][:tok_len]
+        token_list.append(prompt_tokens + generated_speech_tokens_list[i])
+        prompt_feat_list.append(prompt_mels[i:i + 1, :2 * tok_len].to(model.device))
+
+    mels = flow_inference_batched(model.flow, token_list, prompt_feat_list, spk_emb)
+
+    wavs = []
+    for mel in mels:
+        wav, _ = model.hift.inference(speech_feat=mel, finalize=True)
+        wavs.append(wav)
+    return wavs
+
+
+def apply_flashinfer(model, enable_cuda_graph=False, cuda_graph_buckets=None):
+    """Patch a CosyVoice3_Token2Wav instance: fp16 flow + flashinfer estimator."""
+    model.flow.half()
+    model.fp16 = True  # forward_flow autocast context, matching the TRT path
+    ref = model.flow.decoder.estimator
+    device = next(ref.parameters()).device
+
+    fi = FlashInferDiT(enable_cuda_graph=enable_cuda_graph,
+                       cuda_graph_buckets=cuda_graph_buckets, device=str(device))
+    missing, unexpected = fi.load_state_dict(ref.state_dict(), strict=False)
+    missing = [k for k in missing if "rope" not in k]
+    assert not missing and not unexpected, f"state_dict mismatch: {missing} {unexpected}"
+    fi = fi.to(device=device, dtype=torch.float16).eval()
+    fi.finalize_weights()
+    model.flow.decoder.estimator = fi
+    return model
+
+
+@torch.inference_mode()
+def self_test(model_dir="./Fun-CosyVoice3-0.5B-2512"):
+    from token2wav_cosyvoice3 import CosyVoice3_Token2Wav
+
+    model = CosyVoice3_Token2Wav(model_dir, enable_trt=False)
+    model.flow.half()
+    ref = model.flow.decoder.estimator  # torch DiT, fp16
+    device = next(ref.parameters()).device
+
+    for graph_mode in (False, True):
+        fi = FlashInferDiT(enable_cuda_graph=graph_mode, device=str(device))
+        fi.load_state_dict(ref.state_dict(), strict=False)
+        fi = fi.to(device=device, dtype=torch.float16).eval()
+        fi.finalize_weights()
+
+        torch.manual_seed(0)
+        for n in (200, 517, 900):
+            x = torch.randn(2, 80, n, device=device, dtype=torch.float16)
+            mask = torch.ones(2, 1, n, device=device, dtype=torch.float16)
+            mu = torch.randn(2, 80, n, device=device, dtype=torch.float16)
+            t = torch.rand(1, device=device, dtype=torch.float16).expand(2).contiguous()
+            spks = torch.randn(2, 80, device=device, dtype=torch.float16)
+            cond = torch.randn(2, 80, n, device=device, dtype=torch.float16)
+
+            out_ref = ref(x, mask, mu, t, spks, cond, streaming=False)
+            out_fi = fi(x, mask, mu, t, spks, cond)
+            diff = (out_ref - out_fi).abs().max().item()
+            rel = diff / out_ref.abs().max().item()
+            print(f"graph={graph_mode} n={n}: max_abs={diff:.5f} rel={rel:.5f}")
+            # This DiT runs hidden activations at magnitude ~6000 (fp16 ulp = 4!),
+            # so two numerically-equivalent fp16 implementations with different
+            # summation orders legitimately diverge by a few percent (layer-wise
+            # deltas are 1-17 ulp). ref16-vs-ref32 looks tighter only because the
+            # kernel order is identical. End-to-end ASR is the real quality gate.
+            assert rel < 0.15, "flashinfer estimator diverges beyond fp16-order noise"
+    print("self-test passed")
+
+
+if __name__ == "__main__":
+    self_test()
