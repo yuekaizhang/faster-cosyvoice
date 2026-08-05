@@ -6,3 +6,4 @@
 datasets
 soundfile
 pytest
+numpy==2.3.5   # 必须与 vllm025_venv 层的 numba/librosa 匹配；uv 默认会拉 2.5 导致 Numba ImportError
