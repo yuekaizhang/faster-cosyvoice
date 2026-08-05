@@ -212,7 +212,7 @@ POST /v1/audio/speech(stream=true)
 | DiT | dim 1024 × 22 层 × 16 头 × 64；partial RoPE 仅首 64 通道（head 0） |
 | campplus | kaldi fbank 80 维 @16k、去均值 → 192 维 |
 | ref 音频 | 输入 16kHz mono；prompt feat/token 2:1 截断给 flow，完整 token 给 LLM |
-| GPU 显存 | server：vLLM gpu_memory_utilization 0.5；offline：0.8；token2wav 常驻 ~3–4GB |
+| GPU 显存 | server：vLLM gpu_memory_utilization 0.5；offline：0.6（实施修正：原定 0.8 在 80GB H100 上 OOM——dspark draft 的 KV/graphs ~12GB 不计入 vLLM 配额，且 token2wav/frontend 同卡常驻）；token2wav 常驻 ~3–4GB |
 
 ## 附录 B — cosyvoice 代码拷贝清单（自 duplex fork）
 
