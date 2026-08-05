@@ -47,6 +47,7 @@ def main():
         path = os.path.join(args.wav_dir, f"{uid}.wav")
         audio, sr = sf.read(path, dtype="float32")
         s = rec.create_stream()
+        # sherpa-onnx 内部会把 24k 重采样到 paraformer 的 16k（AcceptWaveform 带 sr 参数即为此）
         s.accept_waveform(sr, audio)
         rec.decode_stream(s)
         c = cer(ref_text, s.result.text)

@@ -7,6 +7,7 @@ num_speculative_tokens ← block_size - 1，
 rp != 1.0 时开 draft_apply_repetition_penalty（vllm PR #48932 mirror）。
 """
 import json
+import logging
 import os
 
 from faster_cosyvoice.config import LLMConfig
@@ -18,7 +19,8 @@ def load_draft_config(draft_model: str) -> dict:
         with open(local) as f:
             return json.load(f)
     from huggingface_hub import hf_hub_download
-    return json.load(open(hf_hub_download(draft_model, "config.json")))
+    with open(hf_hub_download(draft_model, "config.json")) as f:
+        return json.load(f)
 
 
 def build_llm_kwargs(cfg: LLMConfig) -> dict:
@@ -67,6 +69,6 @@ def read_spec_counters(llm) -> dict:
         for m in llm.get_metrics():
             if "spec_decode" in m.name and hasattr(m, "value"):
                 counters[m.name] = m.value
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).debug("get_metrics failed: %s", e)
     return counters

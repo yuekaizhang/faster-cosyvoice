@@ -22,3 +22,11 @@ def test_missing_speech_token_raises():
             return {"<|eos1|>": 1}
     with pytest.raises(ValueError):
         SpeechTokenCodec(Bad())
+
+
+def test_missing_eos_raises():
+    class NoEos:
+        def get_vocab(self):
+            return {f"<|s_{i}|>": 1000 + i for i in range(6561)}
+    with pytest.raises(ValueError):
+        SpeechTokenCodec(NoEos())

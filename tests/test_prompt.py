@@ -1,3 +1,5 @@
+import pytest
+
 from faster_cosyvoice.llm.prompt import build_prompt, speech_id_str
 
 
@@ -16,9 +18,6 @@ def test_build_prompt_prefix_puncts_and_structure():
                      target_text="目标(括号)", prompt_speech_tokens=[1, 2])
     assert p == ("user:You are a helpful assistant.<|endofprompt|>你好引号目标括号"
                  "|assistant:<|s_1|><|s_2|>")
-
-
-import pytest
 
 
 @pytest.mark.integration

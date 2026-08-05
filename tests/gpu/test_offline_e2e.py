@@ -2,6 +2,7 @@
 """容器内运行：pytest tests/gpu -m gpu -v。跑通 offline 全链路并做基本音频断言。"""
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -17,7 +18,8 @@ def test_offline_e2e_dataset():
            "--dataset", "yuekai/seed_tts_cosy2", "--split", "wenetspeech4tts",
            "--limit", "4", "--batch-size", "2",
            "--output-dir", OUT]
-    subprocess.run(cmd, check=True)
+    shutil.rmtree(OUT, ignore_errors=True)
+    subprocess.run(cmd, check=True, timeout=1800)
     metrics = json.load(open(os.path.join(OUT, "metrics.json")))
     assert metrics["failed"] == []
     assert metrics["finished_by_stop"] >= 3  # 允许个别 length 截断

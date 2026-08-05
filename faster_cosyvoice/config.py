@@ -20,7 +20,7 @@ class LLMConfig:
     top_p: float = 0.95
     top_k: int = 15
     repetition_penalty: float = 1.1
-    max_tokens: int = 2048
+    max_tokens: int = 2048  # 上限；server(M2) 实际 min(2048, 20×text_len)
 
 
 @dataclass

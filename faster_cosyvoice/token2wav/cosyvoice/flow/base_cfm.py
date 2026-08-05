@@ -1,3 +1,5 @@
+# Vendored from Matcha-TTS (MIT) matcha/models/components/flow_matching.py —
+# kept BASECFM only (CFM/Decoder/pylogger dropped). See Task 8 commit for provenance.
 from abc import ABC
 
 import torch

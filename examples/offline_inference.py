@@ -71,7 +71,10 @@ def load_items(args):
         items = []
         for i, row in enumerate(ds):
             audio = row["prompt_audio"]
-            array, sr = sf.read(io.BytesIO(audio["bytes"]), dtype="float32")
+            if audio["bytes"] is None:
+                array, sr = sf.read(audio["path"], dtype="float32")
+            else:
+                array, sr = sf.read(io.BytesIO(audio["bytes"]), dtype="float32")
             if array.ndim > 1:
                 array = array.mean(axis=1)
             items.append(dict(
@@ -122,15 +125,17 @@ def main():
     token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,
                                     estimator_mode=t2w_cfg.estimator_mode)
 
-    metrics = dict(llm_wall_s=0.0, t2w_wall_s=0.0, output_tokens=0,
-                   finished_by_stop=0, failed=[])
+    metrics = dict(llm_wall_s=0.0, t2w_wall_s=0.0, frontend_wall_s=0.0,
+                   output_tokens=0, finished_by_stop=0, failed=[])
     expected = {}
     spec_before = read_spec_counters(llm)
 
     for s in range(0, len(items), args.batch_size):
         batch = items[s:s + args.batch_size]
+        t0 = time.perf_counter()
         conds = frontend.process_batch([it["ref_wav"] for it in batch],
                                        [it["ref_sr"] for it in batch])
+        metrics["frontend_wall_s"] += time.perf_counter() - t0
         prompts = [build_prompt(tokenizer, it["ref_text"], it["target_text"],
                                 c.prompt_tokens_llm)
                    for it, c in zip(batch, conds)]
@@ -182,7 +187,9 @@ def main():
         llm_tok_per_s=round(metrics["output_tokens"]
                             / max(metrics["llm_wall_s"], 1e-9), 1),
         t2w_wall_s=round(metrics["t2w_wall_s"], 2),
+        frontend_wall_s=round(metrics["frontend_wall_s"], 2),
         audio_seconds=round(audio_s, 1),
+        # rtf = (llm+t2w)/audio；不含 frontend（见 frontend_wall_s）
         rtf=round(wall / max(audio_s, 1e-9), 4))
     if drafts:
         summary["spec"] = dict(
