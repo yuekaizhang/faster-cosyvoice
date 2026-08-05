@@ -2,21 +2,23 @@
 import inspect
 
 
-def _importable(mod: str) -> bool:
-    # 用内建 __import__（而非 importlib.import_module），使测试可通过
-    # monkeypatch builtins.__import__ 模拟缺依赖。
+def _import_problem(mod: str) -> str | None:
+    """None = importable；否则返回失败原因（含崩溃型 import）。"""
+    # 用内建 __import__ 而非 importlib.import_module，测试才能 monkeypatch builtins.__import__
     try:
         __import__(mod)
-        return True
+        return None
     except ImportError:
-        return False
+        return "不可导入"
+    except Exception as e:  # 装了但 import 崩（缺 CUDA 库等）
+        return f"导入崩溃: {e!r}"
 
 
 def _has_draft_mirror() -> bool:
     """探测 patched vllm 的 rep-penalty mirror（vllm PR #48932）。"""
     try:
         from vllm.config import SpeculativeConfig
-    except ImportError:
+    except Exception:
         return False
     try:
         src = inspect.getsource(SpeculativeConfig)
@@ -33,14 +35,17 @@ def check_environment(require_flashinfer: bool = True,
         ("s3tokenizer", "pip install s3tokenizer"),
         ("onnxruntime", "pip install onnxruntime"),
     ]:
-        if not _importable(mod):
-            problems.append(f"{mod} 不可导入 — {hint}")
+        reason = _import_problem(mod)
+        if reason is not None:
+            problems.append(f"{mod} {reason} — {hint}")
     if require_flashinfer:
-        if not _importable("flashinfer"):
-            problems.append("flashinfer 不可导入 — pip install flashinfer-python；"
+        reason = _import_problem("flashinfer")
+        if reason is not None:
+            problems.append(f"flashinfer {reason} — pip install flashinfer-python；"
                             "或用 --estimator torch 降级")
-        if not _importable("triton"):
-            problems.append("triton 不可导入（flashinfer packed 批量必需）")
+        reason = _import_problem("triton")
+        if reason is not None:
+            problems.append(f"triton {reason}（flashinfer packed 批量必需）")
     if require_draft_mirror and not _has_draft_mirror():
         problems.append(
             "patched vllm 未生效（缺 draft_apply_repetition_penalty）— "
