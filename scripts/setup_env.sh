@@ -22,8 +22,10 @@ uv pip install --python venv/bin/python datasets soundfile pytest
 #   SPEC_VLLM_SRC=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative/vllm bash scripts/setup_env.sh
 SPEC_VLLM_DIR=$PWD/third_party/spec-vllm
 SPEC_VLLM_SRC=${SPEC_VLLM_SRC:-https://github.com/yuekaizhang/vllm}
-if [ ! -d "$SPEC_VLLM_DIR" ]; then
-  git clone -b dspark-draft-sampling-mirrors "$SPEC_VLLM_SRC" "$SPEC_VLLM_DIR"
+if [ ! -e "$SPEC_VLLM_DIR/vllm/__init__.py" ]; then
+  rm -rf "$SPEC_VLLM_DIR" "$SPEC_VLLM_DIR.tmp"
+  git clone -b dspark-draft-sampling-mirrors "$SPEC_VLLM_SRC" "$SPEC_VLLM_DIR.tmp"
+  mv "$SPEC_VLLM_DIR.tmp" "$SPEC_VLLM_DIR"
 fi
 find "$V025_SITE/vllm" -maxdepth 1 -name "*.so" -exec ln -sf {} "$SPEC_VLLM_DIR/vllm/" \;
 # _version.py 由构建生成，fork 源码树里没有；同样从 wheel 软链（同用户本地镜像的做法）
