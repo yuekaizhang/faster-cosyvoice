@@ -1,0 +1,8 @@
+# 运行环境为分层复用（见 scripts/setup_env.sh），不通过本文件安装 vllm：
+#   - vllm==0.25.1 wheel（dspark 投机解码内置）+ 全部重依赖来自 vllm025_venv（.pth 挂载）
+#   - yuekaizhang/vllm@dspark-draft-sampling-mirrors 源码盖 PYTHONPATH（rep-penalty mirror，PR #48932）
+#   - flashinfer==0.6.13 / s3tokenizer / x-transformers / librosa / einops / onnxruntime / omegaconf 均已在 venv 内
+# 本文件只列额外安装进本仓 venv 的包：
+datasets
+soundfile
+pytest
