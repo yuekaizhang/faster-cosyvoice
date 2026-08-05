@@ -53,7 +53,7 @@ prompt 用 chat template `continue_final_message` 续写 `<|s_N|>`；标准采�
 token2wav 本来就需要 ref audio（mel + campplus），统一用 s3tokenizer `speech_tokenizer_v3_25hz` GPU torch 模型现算 v3 token（比捆绑 ONNX CPU 路径快 ~30x，vllm-omni 经验）；数据集若带 `prompt_audio_cosy3_tokens` 列则作为 fast path 直接采用。因此任何带（audio, text, target_text）的数据集都能跑，不依赖预算 token 列。
 
 **D5 环境固化。**
-`pip install vllm-omni==0.25.1`（提供 DSpark method + probabilistic draft sampling）+ `git clone -b dspark-draft-sampling-mirrors https://github.com/yuekaizhang/vllm` 以 PYTHONPATH 覆盖（提供 rep-penalty mirror，vllm PR #48932 合并前必需；含 .so 从 venv 软链进源码树的技巧）+ flashinfer + triton + s3tokenizer。写进 `scripts/setup_env.sh` 与带注释的 `requirements.txt`，服务启动时做版本/符号自检。
+（实施修正，2026-08-05：`vllm-omni==0.25.1` 在 PyPI 不存在，且 DSpark 实现在 **vllm 0.25.1 wheel 本体**（`vllm/v1/worker/gpu/spec_decode/`），vllm-omni 并非依赖。）实际配方：分层复用现有 `tts/vllm025_venv`（vllm==0.25.1 wheel + torch/flashinfer 0.6.13/triton/s3tokenizer/x-transformers 等全部重依赖）——本仓 venv（py3.12，uv 管理）通过 `.pth` 挂载其 site-packages，仅补装 datasets/soundfile/pytest；`yuekaizhang/vllm@dspark-draft-sampling-mirrors` 源码盖 PYTHONPATH（rep-penalty mirror，PR #48932 合并前必需；`.so` 与 `_version.py` 从 wheel 软链进源码树）。写进 `scripts/setup_env.sh`，服务启动时做版本/符号自检。
 
 **D6 单 GPU 默认共存。**
 vLLM `gpu_memory_utilization`：server 0.5 / offline 0.8 可配；token2wav 同卡常驻（~3–4GB）；`--token2wav-device` 可选分卡。
@@ -165,7 +165,7 @@ POST /v1/audio/speech(stream=true)
 
 ## 7. 错误处理与部署
 
-**启动期 fail fast**：assets 缺失报确切 repo id；环境自检（patched vllm 的 rp-mirror 符号、vllm-omni 版本、flashinfer/s3tokenizer/triton 可导入）不过则带修复指引退出；warmup 失败即启动失败。campplus TRT plan 按 device+TRT 版本落盘缓存。
+**启动期 fail fast**：assets 缺失报确切 repo id；环境自检（patched vllm 的 rp-mirror 符号、vllm==0.25.1、flashinfer/s3tokenizer/triton 可导入）不过则带修复指引退出；warmup 失败即启动失败。campplus TRT plan 按 device+TRT 版本落盘缓存。
 
 **请求期错误只杀本请求**：入参校验 400（ref_audio 解码失败/缺 ref_text/空 input；ref 统一重采样 16k mono，>30s 截断并警告）；`finish_reason=length` 照常合成但计数告警；LLM 结束且累计有效 speech token 为 0 → 500（只要有非零余量就按 §5.3 finalize 出短音频）；token2wav 异常/OOM 由 batcher 捕获、只 fail 该 job 的 future，worker 存活；v2 packed cap 批大小。offline 模式逐条记录失败不中断整批。全局每请求超时旋钮。
 
@@ -193,7 +193,7 @@ POST /v1/audio/speech(stream=true)
 
 1. **flashinfer 流式 mask（M3 核心风险）**：chunk-causal custom mask 的正确性需 GPU 上以 torch streaming 输出为参照 + ASR 验证；plan/mask 内存与缓存策略需实测。M3 失败不影响 M1/M2 可用性。
 2. **hift 全量重跑 O(T²)**：流式路径 hift 每 chunk 重跑累计 mel；hop 翻倍部分摊销，长输出（>30s）下的尾部延迟需实测，必要时限制单请求时长或引入 hift 增量 cache（CosyVoice 上游有 mel/source cache + fade 方案可参考）。
-3. **环境脆弱**：PYTHONPATH 覆盖 wheel 的方式对 vllm-omni 升级敏感；PR #48932 合并后应尽快去掉 overlay。flashinfer/triton 版本未在参考源钉死，plan() 签名随版本变化——requirements.txt 里显式钉。
+3. **环境脆弱**：PYTHONPATH 覆盖 wheel 的方式对 vllm 升级敏感；PR #48932 合并后应尽快去掉 overlay。flashinfer/triton 版本未在参考源钉死，plan() 签名随版本变化——requirements.txt 里显式钉。
 4. **spec decode 高并发收益递减**（bs64 仅 1.18x）：server 高并发场景可能需要默认关 draft；做成运行时配置并在文档写明。
 5. **s3tokenizer 版本**：确认 pip 版本支持 `speech_tokenizer_v3_25hz` GPU torch 模型加载。
 6. **数据集 token 列陷阱**：`yuekai/seed_tts_cosy2` 的 `prompt_audio_cosy2_tokens` 是 CV2 token，对 CV3 无效——已由 D4（现场计算）规避，脚本忽略 cosy2 列。
