@@ -272,8 +272,11 @@ class RaggedAttentionRunner:
                 [seq_len] * batch_size, chunk_size)
             # [M3] split-kv scheduling depends on TOTAL batch workload, which
             # makes a doc's output vary with batch composition (measured
-            # ~4e-3/layer, ~0.09 mel after 10 euler steps). Streaming batching
-            # promises B=1 == B=N per doc (Task 3 gate B), so pin it off.
+            # ~4e-3/layer, ~0.09 mel after 10 euler steps → ~1.3 audio after
+            # hift). Streaming batching promises B=1 == B=N per doc (Task 3
+            # gate B), so pin it off — 只作用于流式 plan；offline 路径保留
+            # split-kv（其 parity 门本就是容差制，且小 chunk 下关 split-kv 的
+            # SM 占用代价在 Task 5 基准中观测）。
             kwargs["disable_split_kv"] = True
         self.wrapper.plan(
             indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
