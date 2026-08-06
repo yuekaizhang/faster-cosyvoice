@@ -3,6 +3,8 @@
 保持 .flow/.hift/.device/.fp16 属性名与 duplex CosyVoice3_Token2Wav 一致，
 使 flashinfer_dit.apply_flashinfer 不改即可用。
 """
+from typing import Optional
+
 import torch
 
 from faster_cosyvoice.token2wav.builders import build_flow, build_hift
@@ -10,7 +12,8 @@ from faster_cosyvoice.token2wav.builders import build_flow, build_hift
 
 class CosyVoice3Token2Wav(torch.nn.Module):
     def __init__(self, model_dir: str, device: str = "cuda:0",
-                 estimator_mode: str = "flashinfer"):
+                 estimator_mode: str = "flashinfer",
+                 cuda_graph_buckets: Optional[list] = None):
         super().__init__()
         self.device = device
         self.fp16 = False
@@ -30,7 +33,15 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         self.estimator_mode = estimator_mode
         if estimator_mode == "flashinfer":
             from faster_cosyvoice.token2wav.flashinfer_dit import apply_flashinfer
-            apply_flashinfer(self)  # flow→fp16、estimator 替换、self.fp16=True
+            # cuda_graph_buckets：秒数列表（总时长 prompt+generated），开启
+            # duration-bucketed CUDA graphs。仅 offline batch=1（CFG 双行
+            # b==2、streaming=False）命中 graph 分支；流式被 M3 gate 排除，
+            # packed batch>1（b==2B>2）仍走 packed varlen 路径。
+            apply_flashinfer(
+                self,
+                enable_cuda_graph=bool(cuda_graph_buckets),
+                cuda_graph_buckets=cuda_graph_buckets,
+            )  # flow→fp16、estimator 替换、self.fp16=True
 
     @torch.inference_mode()
     def offline_batch(self, generated_tokens_list: list, conds: list,

@@ -30,6 +30,9 @@ class Token2WavConfig:
     estimator_mode: str = "flashinfer"      # flashinfer | torch
     batch_size: int = 8                     # flashinfer packed 子批上限（防 OOM）
     batch_mode: str = "packed"              # [M3] packed | serial（batcher v2；与 CLI 默认一致）
+    # 逗号分隔秒数字符串（总时长 prompt+generated，如 "8,12,16,20,24"）；
+    # None=关。仅 offline batch=1（CFG 双行 b==2）走 bucketed CUDA graph。
+    cuda_graph_buckets: Optional[str] = None
 
 
 @dataclass

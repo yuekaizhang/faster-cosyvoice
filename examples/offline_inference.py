@@ -54,6 +54,10 @@ def get_args():
     p.add_argument("--token2wav-batch-size", type=int, default=8)
     p.add_argument("--token2wav-device", default="cuda:0",
                    help="token2wav/frontend 所在设备（spec D6：可与 LLM 分卡）")
+    p.add_argument("--t2w-cuda-graph-buckets", default=None,
+                   help="逗号分隔秒数（总时长 prompt+generated，如 "
+                        "'8,12,16,20,24'）：开 batch=1 offline flow 的 "
+                        "bucketed CUDA graphs；默认关")
     p.add_argument("--output-dir", default="results/offline")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -105,7 +109,8 @@ def main():
     t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
                               device=args.token2wav_device,
                               estimator_mode=args.estimator,
-                              batch_size=args.token2wav_batch_size)
+                              batch_size=args.token2wav_batch_size,
+                              cuda_graph_buckets=args.t2w_cuda_graph_buckets)
 
     problems = check_environment(
         require_flashinfer=(args.estimator == "flashinfer"),
@@ -125,8 +130,11 @@ def main():
     llm = create_offline_llm(llm_cfg)
     frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
                                 device=t2w_cfg.device)
+    buckets = ([float(s) for s in t2w_cfg.cuda_graph_buckets.split(",")]
+               if t2w_cfg.cuda_graph_buckets else None)
     token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,
-                                    estimator_mode=t2w_cfg.estimator_mode)
+                                    estimator_mode=t2w_cfg.estimator_mode,
+                                    cuda_graph_buckets=buckets)
 
     metrics = dict(llm_wall_s=0.0, t2w_wall_s=0.0, frontend_wall_s=0.0,
                    output_tokens=0, finished_by_stop=0, failed=[])
