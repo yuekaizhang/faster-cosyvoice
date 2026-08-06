@@ -35,7 +35,7 @@ def main():
                       timeout=300) as r:
         r.raise_for_status()
         for chunk in r.iter_bytes():
-            if ttfa is None and len(data) > 44:  # 头之后的首个音频块
+            if ttfa is None and len(data) + len(chunk) > 44:  # 首个音频字节
                 ttfa = time.perf_counter() - t0
             data += chunk
     if ttfa is None:

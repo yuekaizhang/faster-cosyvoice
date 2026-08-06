@@ -51,7 +51,7 @@ async def _stream_one(client, ref_url, ref_text, text, idx):
                              timeout=300) as r:
         assert r.status_code == 200
         async for chunk in r.aiter_bytes():
-            if ttfa is None and len(data) > 44:  # 头之后的首个音频块
+            if ttfa is None and len(data) + len(chunk) > 44:  # 首个音频字节
                 ttfa = time.perf_counter() - t0
             data += chunk
     pcm = np.frombuffer(data[44:], dtype="<i2").astype(np.float32) / 32767
@@ -110,4 +110,8 @@ def test_server_streaming_e2e():
             json.dump(expected, f, ensure_ascii=False)
     finally:
         proc.terminate()
-        proc.wait(timeout=30)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
