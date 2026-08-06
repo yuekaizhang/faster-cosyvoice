@@ -270,6 +270,11 @@ class RaggedAttentionRunner:
         if chunk_size is not None:  # [M3]
             kwargs["custom_mask"] = self._custom_mask(
                 [seq_len] * batch_size, chunk_size)
+            # [M3] split-kv scheduling depends on TOTAL batch workload, which
+            # makes a doc's output vary with batch composition (measured
+            # ~4e-3/layer, ~0.09 mel after 10 euler steps). Streaming batching
+            # promises B=1 == B=N per doc (Task 3 gate B), so pin it off.
+            kwargs["disable_split_kv"] = True
         self.wrapper.plan(
             indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
             causal=False, sm_scale=self.head_dim ** -0.5,
@@ -289,6 +294,9 @@ class RaggedAttentionRunner:
         kwargs = {}
         if chunk_size is not None:  # [M3]
             kwargs["custom_mask"] = self._custom_mask(doc_lens, chunk_size)
+            # [M3] see plan(): batch-composition-invariant per-doc outputs
+            # (stream_step_batched parity gate) require split-kv off.
+            kwargs["disable_split_kv"] = True
         self.wrapper.plan(
             indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
             causal=False, sm_scale=self.head_dim ** -0.5,
@@ -710,7 +718,8 @@ class FlashInferDiT(nn.Module):
 
 
 @torch.inference_mode()
-def _solve_euler_batched(decoder, z, mu, mask, spks, cond, n_timesteps=10):
+def _solve_euler_batched(decoder, z, mu, mask, spks, cond, n_timesteps=10,
+                         streaming=False):  # [M3] thread streaming flag
     """Batched CFG euler solver: the repo's solve_euler hardcodes batch=1
     buffers, so multi-sample batches build the 2B-row CFG stack here."""
     B = mu.shape[0]
@@ -729,7 +738,7 @@ def _solve_euler_batched(decoder, z, mu, mask, spks, cond, n_timesteps=10):
         x_in = x.repeat(2, 1, 1)
         t_in.fill_(t)
         dphi_dt = decoder.forward_estimator(
-            x_in, mask_in, mu_in, t_in, spks_in, cond_in, False)
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in, streaming)  # [M3]
         dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [B, B], dim=0)
         dphi_dt = ((1.0 + decoder.inference_cfg_rate) * dphi_dt
                    - decoder.inference_cfg_rate * cfg_dphi_dt)
@@ -793,6 +802,104 @@ def flow_inference_batched(flow, token_list, prompt_feat_list, embedding):
         n_timesteps=10,
     )
     return [feat[i:i + 1, :, mel_len1[i]:int(mel_lens[i])].float() for i in range(B)]
+
+
+@torch.inference_mode()
+def flow_inference_batched_streaming(flow, token_list, prompt_feat_list,
+                                     embedding, finalize_list):
+    """[M3] Batched replica of CausalMaskedDiffWithDiT.inference (STREAMING),
+    per-row mirror of vendored flow.py:364-409 with streaming=True.
+
+    Diffs vs flow_inference_batched (offline) above:
+    1. finalize semantics (flow.py:386-389): a doc with finalize=False routes
+       its last `flow.pre_lookahead_len` tokens as PreLookaheadLayer *context*
+       (conv right-lookahead) — those tokens do NOT enter the mu sequence, so
+       its mel length is (n_tokens - pre_lookahead_len) * token_mel_ratio.
+       finalize=True docs get full offline-style processing.
+    2. embedding/lookahead run per-doc, not on a padded batch: the context
+       kwarg differs per doc, so the offline "zero right-pad == batch pad"
+       equivalence no longer applies; per-doc also keeps the op sequence
+       bit-identical to the single-request stream_step path.
+    3. F.normalize on the fp32 speaker embedding BEFORE the fp16 affine
+       (matching stream_step's autocast semantics: normalize is not an
+       autocast-fp16 op; the offline batched variant casts to fp16 first).
+    4. noise is the decoder's fixed rand_noise prefix (flow_matching.py:222),
+       not torch.randn: full-prefix recompute across chunks must be
+       deterministic, and this keeps B=1 parity with stream_step. All docs
+       slice the same noise from position 0, so one expand serves the batch.
+    5. _solve_euler_batched(..., streaming=True) -> forward_estimator gets
+       streaming=True -> plan_docs(chunk_size) per-doc chunk-causal masks.
+
+    Args:
+        flow: CausalMaskedDiffWithDiT (fp16, flashinfer estimator).
+        token_list: per-doc [prompt_tokens + generated_prefix] (list of
+            list[int]) — pre-concatenated exactly like the offline batched
+            entry point; vendored inference() concatenates prompt_token
+            before token prior to any processing (flow.py:381), so this is
+            equivalent and keeps one signature for both batched paths.
+        prompt_feat_list: per-doc prompt mel (1, L_i, 80).
+        embedding: (B, 192) fp32 speaker embeddings.
+        finalize_list: per-doc finalize flag (see diff 1).
+    Returns:
+        list of per-doc FULL-PREFIX generated mel (1, 80, mel_len2_i), fp32,
+        prompt part excluded (flow.py:407 slice); caller slices the new tail
+        by token_offset * token_mel_ratio.
+    """
+    device = embedding.device
+    from faster_cosyvoice.token2wav.cosyvoice.utils.mask import make_pad_mask
+
+    B = len(token_list)
+    dtype = next(flow.parameters()).dtype
+    lookahead = flow.pre_lookahead_len
+
+    # xvec projection (flow.py:377-378; fp32 normalize per diff 3)
+    embedding = F.normalize(embedding.float(), dim=1)
+    embedding = flow.spk_embed_affine_layer(embedding.to(dtype))
+
+    # per-doc embedding lookup + lookahead conv (diffs 1-2). B=1 masks are
+    # all-ones so the vendored `* mask` (flow.py:383) is an exact no-op here.
+    h_list, mel_len1, mel_lens = [], [], []
+    for i, tk in enumerate(token_list):
+        tok = torch.tensor([tk], dtype=torch.long, device=device)
+        emb_tok = flow.input_embedding(torch.clamp(tok, min=0))
+        if finalize_list[i]:
+            h_i = flow.pre_lookahead_layer(emb_tok)
+        else:
+            h_i = flow.pre_lookahead_layer(emb_tok[:, :-lookahead],
+                                           context=emb_tok[:, -lookahead:])
+        h_i = h_i.repeat_interleave(flow.token_mel_ratio, dim=1)
+        h_list.append(h_i)
+        mel_len1.append(prompt_feat_list[i].shape[1])
+        mel_lens.append(h_i.shape[1])
+
+    max_mel = max(mel_lens)
+    mu = torch.zeros(B, max_mel, h_list[0].shape[-1], device=device,
+                     dtype=dtype)
+    conds = torch.zeros(B, max_mel, flow.output_size, device=device,
+                        dtype=dtype)
+    for i in range(B):
+        mu[i, :mel_lens[i]] = h_list[i][0]
+        conds[i, :mel_len1[i]] = prompt_feat_list[i][0].to(dtype)
+    conds = conds.transpose(1, 2)
+
+    mel_lens_t = torch.tensor(mel_lens, device=device)
+    mel_mask = (~make_pad_mask(mel_lens_t, max_len=max_mel)).to(mu)
+
+    # fixed noise (diff 4): same prefix of the same buffer for every doc
+    z = flow.decoder.rand_noise[:, :, :max_mel].to(device).to(dtype)
+    z = z.expand(B, -1, -1)
+
+    feat = _solve_euler_batched(
+        flow.decoder, z,
+        mu=mu.transpose(1, 2).contiguous(),
+        mask=mel_mask.unsqueeze(1),
+        spks=embedding,
+        cond=conds,
+        n_timesteps=10,
+        streaming=True,  # [M3] diff 5: chunk-causal masks in the estimator
+    )
+    return [feat[i:i + 1, :, mel_len1[i]:mel_lens[i]].float()
+            for i in range(B)]
 
 
 @torch.inference_mode()

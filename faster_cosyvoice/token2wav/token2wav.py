@@ -111,7 +111,15 @@ class CosyVoice3Token2Wav(torch.nn.Module):
                                              device=self.device),
                 embedding=embedding,
                 streaming=True, finalize=plan.finalize)
-        mel = mel[:, :, plan.token_offset * self.flow.token_mel_ratio:]
+        return self._finish_chunk(session, plan, mel)
+
+    def _finish_chunk(self, session, plan, mel_full: torch.Tensor
+                      ) -> torch.Tensor:
+        """[M3] flow 之后的逐 session 收尾（stream_step 与 stream_step_batched
+        共用，防两路逻辑漂移）：mel_full 为本步 flow 输出的全前缀生成 mel
+        （fp32、不含 prompt）→ 按 token_offset×ratio 切新段 → 拼 mel_cache →
+        hift 全量重跑 → 按 speech_offset 切新音频 → chunk_index++。"""
+        mel = mel_full[:, :, plan.token_offset * self.flow.token_mel_ratio:]
         if session.mel_cache is not None:
             mel = torch.cat([session.mel_cache, mel], dim=2)
         session.mel_cache = mel
@@ -121,3 +129,28 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         session.speech_offset += new.shape[1]
         session.chunk_index += 1
         return new.cpu()
+
+    @torch.inference_mode()
+    def stream_step_batched(self, sessions, plans) -> list:
+        """[M3] 跨 session 批量流式单步（spec M3 批量层）：packed flashinfer
+        flow 一次算整批（per-doc chunk-causal mask），随后逐 session 走与
+        stream_step 完全相同的 _finish_chunk 收尾。仅 flashinfer 模式（torch
+        estimator 无 packed 路径）。输入输出按 sessions 顺序一一对应。"""
+        assert self.estimator_mode == "flashinfer", (
+            "stream_step_batched requires estimator_mode='flashinfer', got "
+            f"{self.estimator_mode}")
+        assert len(sessions) == len(plans) and len(sessions) > 0
+        from faster_cosyvoice.token2wav.flashinfer_dit import (
+            flow_inference_batched_streaming)
+        token_list = [list(s.cond.prompt_tokens_flow)
+                      + list(s.tokens[:p.prefix_len])
+                      for s, p in zip(sessions, plans)]
+        prompt_feat_list = [s.cond.prompt_feat.to(self.device)
+                            for s in sessions]
+        emb = torch.stack([s.cond.spk_embedding
+                           for s in sessions]).to(self.device)
+        finalize_list = [p.finalize for p in plans]
+        mels = flow_inference_batched_streaming(
+            self.flow, token_list, prompt_feat_list, emb, finalize_list)
+        return [self._finish_chunk(s, p, mel)
+                for s, p, mel in zip(sessions, plans, mels)]
