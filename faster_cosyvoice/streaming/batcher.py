@@ -111,6 +111,8 @@ class Token2WavWorker:
             _, _, session, plan, fut = entry
             if fut.cancelled():   # 断连丢弃（同 serial 语义）
                 continue
+            # id() 去重：StreamSession 是 eq=True 的 dataclass（不可哈希），
+            # 且 batch/deferred 全程持强引用，id 不会因 GC 复用——勿"简化"成 in。
             sid = id(session)
             if sid in seen_sessions:
                 deferred.append(entry)
@@ -127,8 +129,10 @@ class Token2WavWorker:
             results = await loop.run_in_executor(
                 self._gpu, self._t2w.stream_step_batched, sessions, plans)
         except Exception as e:  # noqa: BLE001 —— worker 存活
-            # 整批失败即全批 fail：v1 可接受语义（无法归因单 doc，且
-            # stream_step_batched 抛错时各 session 状态未推进，不会错位）。
+            # 整批失败即全批 fail：v1 可接受语义。安全性依据：flow 阶段原子；
+            # _finish_chunk 阶段部分 session 可能已推进，但全批 future 均拿到
+            # 异常 → 各请求失败 → session 被丢弃且（flush 串行 submit）不会再
+            # 收到后续 job，故不会错位。
             for _, _, fut in batch:
                 if not fut.cancelled():
                     fut.set_exception(e)
