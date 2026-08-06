@@ -160,18 +160,20 @@ def main():
     p.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     p.add_argument("--request-timeout-s", type=float, default=300.0,
                    help="非流式请求超时（spec §7；流式超时靠客户端）")
-    p.add_argument("--stream-estimator", default="torch",
+    p.add_argument("--stream-estimator", default="flashinfer",
                    choices=["torch", "flashinfer"],
-                   help="[M3] 流式 flow estimator（默认 torch；"
-                        "flashinfer = chunk-causal mask fp16 路径）")
-    p.add_argument("--t2w-batch-mode", default="serial",
+                   help="[M3] 流式 flow estimator（默认 flashinfer = chunk-causal "
+                        "mask fp16 路径；torch 为回退）")
+    p.add_argument("--t2w-batch-mode", default="packed",
                    choices=["serial", "packed"],
-                   help="[M3] token2wav 批量模式（packed = 跨 session "
-                        "flashinfer 批量，要求 --stream-estimator flashinfer）")
+                   help="[M3] token2wav 批量模式（默认 packed = 跨 session "
+                        "flashinfer 批量；要求 --stream-estimator flashinfer）")
     args = p.parse_args()
     if args.t2w_batch_mode == "packed" and args.stream_estimator != "flashinfer":
         raise SystemExit("--t2w-batch-mode packed 要求 --stream-estimator "
-                         "flashinfer（torch estimator 无 packed 批量路径）")
+                         "flashinfer（torch estimator 无 packed 批量路径）；"
+                         "--stream-estimator torch 需同时指定 "
+                         "--t2w-batch-mode serial")
 
     import os
     os.environ.setdefault("OMP_NUM_THREADS", "1")  # 同 offline 的 fork segfault 规避

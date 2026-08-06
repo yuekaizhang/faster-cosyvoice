@@ -29,7 +29,7 @@ class Token2WavConfig:
     device: str = "cuda:0"
     estimator_mode: str = "flashinfer"      # flashinfer | torch
     batch_size: int = 8                     # flashinfer packed 子批上限（防 OOM）
-    batch_mode: str = "serial"              # [M3] serial | packed（batcher v2）
+    batch_mode: str = "packed"              # [M3] packed | serial（batcher v2；与 CLI 默认一致）
 
 
 @dataclass
