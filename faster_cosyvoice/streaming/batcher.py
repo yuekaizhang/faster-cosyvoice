@@ -16,8 +16,11 @@ from typing import Any, Optional
 
 
 class Token2WavWorker:
-    def __init__(self, token2wav):
+    def __init__(self, token2wav, mode: str = "serial", max_batch: int = 8):
+        assert mode in ("serial", "packed"), f"未知 mode: {mode!r}"
         self._t2w = token2wav
+        self._mode = mode          # [M3] packed = 跨 session 批量执行循环
+        self._max_batch = max_batch
         self._heap: list = []
         self._seq = itertools.count()
         self._wakeup: Optional[asyncio.Event] = None
@@ -71,22 +74,65 @@ class Token2WavWorker:
                         return
                     self._wakeup.clear()
                     await self._wakeup.wait()
-                _, _, session, plan, fut = heapq.heappop(self._heap)
-                # 断连后丢弃该 job（spec §7）。GPU 中途取消会留下已推进的
-                # session 状态——安全：断连 session 直接丢弃，绝不复用。
-                if fut.cancelled():
-                    continue
-                try:
-                    result = await loop.run_in_executor(
-                        self._gpu, self._t2w.stream_step, session, plan)
-                except Exception as e:  # noqa: BLE001 —— 只 fail 本 job，worker 存活
+                if self._mode == "serial":
+                    _, _, session, plan, fut = heapq.heappop(self._heap)
+                    # 断连后丢弃该 job（spec §7）。GPU 中途取消会留下已推进的
+                    # session 状态——安全：断连 session 直接丢弃，绝不复用。
+                    if fut.cancelled():
+                        continue
+                    try:
+                        result = await loop.run_in_executor(
+                            self._gpu, self._t2w.stream_step, session, plan)
+                    except Exception as e:  # noqa: BLE001 —— 只 fail 本 job，worker 存活
+                        if not fut.cancelled():
+                            fut.set_exception(e)
+                        continue
                     if not fut.cancelled():
-                        fut.set_exception(e)
-                    continue
-                if not fut.cancelled():
-                    fut.set_result(result)
+                        fut.set_result(result)
+                else:
+                    await self._run_packed_batch(loop)
         finally:
             # 消费者退出（含被 cancel/异常死亡）：残留 job 取消勿悬挂
             for entry in self._heap:
                 entry[-1].cancel()
             self._heap.clear()
+
+    async def _run_packed_batch(self, loop) -> None:
+        """[M3] packed 执行循环单轮：贪心组批 → 一次 stream_step_batched。
+
+        组批约束：同 session 后续 chunk 不进同批（mel_cache 有前序 chunk
+        依赖，必须串行）——留在堆里下一轮再取。cancelled future 组批时丢弃。
+        """
+        batch: list = []      # (session, plan, fut)，按堆序 = 结果顺序
+        seen_sessions: set = set()
+        deferred: list = []   # 同 session 撞批的 job：原 entry 回堆
+        while self._heap and len(batch) < self._max_batch:
+            entry = heapq.heappop(self._heap)
+            _, _, session, plan, fut = entry
+            if fut.cancelled():   # 断连丢弃（同 serial 语义）
+                continue
+            sid = id(session)
+            if sid in seen_sessions:
+                deferred.append(entry)
+                continue
+            seen_sessions.add(sid)
+            batch.append((session, plan, fut))
+        for entry in deferred:
+            heapq.heappush(self._heap, entry)
+        if not batch:
+            return
+        sessions = [b[0] for b in batch]
+        plans = [b[1] for b in batch]
+        try:
+            results = await loop.run_in_executor(
+                self._gpu, self._t2w.stream_step_batched, sessions, plans)
+        except Exception as e:  # noqa: BLE001 —— worker 存活
+            # 整批失败即全批 fail：v1 可接受语义（无法归因单 doc，且
+            # stream_step_batched 抛错时各 session 状态未推进，不会错位）。
+            for _, _, fut in batch:
+                if not fut.cancelled():
+                    fut.set_exception(e)
+            return
+        for (_, _, fut), result in zip(batch, results):
+            if not fut.cancelled():
+                fut.set_result(result)

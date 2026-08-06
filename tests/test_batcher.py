@@ -91,3 +91,98 @@ async def test_error_fails_only_that_job():
         assert await w.submit("good", "p", chunk_index=0) == "ok"  # worker 存活
     finally:
         await w.stop()
+
+
+# ---------------------------------------------------------------- packed (v2)
+
+class FakeBatchT2W:
+    """fake stream_step_batched：记录每次批量调用，按位置返回结果。"""
+
+    def __init__(self):
+        self.batch_calls = []
+
+    def stream_step_batched(self, sessions, plans):
+        self.batch_calls.append((list(sessions), list(plans)))
+        return [f"pcm-{s}-{p}" for s, p in zip(sessions, plans)]
+
+
+@pytest.mark.asyncio
+async def test_packed_batches_distinct_sessions():
+    """3 个异 session 的 ready job → 一次批量调用收 3 个，结果按 future 路由。"""
+    t2w = FakeBatchT2W()
+    w = Token2WavWorker(t2w, mode="packed", max_batch=8)
+    f1 = w.submit_nowait("s1", "p1", chunk_index=0)
+    f2 = w.submit_nowait("s2", "p2", chunk_index=0)
+    f3 = w.submit_nowait("s3", "p3", chunk_index=0)
+    await w.start()
+    try:
+        assert await asyncio.gather(f1, f2, f3) == [
+            "pcm-s1-p1", "pcm-s2-p2", "pcm-s3-p3"]
+        assert len(t2w.batch_calls) == 1
+        assert len(t2w.batch_calls[0][0]) == 3
+    finally:
+        await w.stop()
+
+
+@pytest.mark.asyncio
+async def test_packed_same_session_split_across_batches():
+    """同 session 两个 chunk 不同批（mel_cache 依赖），chunk 0 先于 chunk 1。"""
+    t2w = FakeBatchT2W()
+    w = Token2WavWorker(t2w, mode="packed", max_batch=8)
+    f0 = w.submit_nowait("s1", "c0", chunk_index=0)
+    f1 = w.submit_nowait("s1", "c1", chunk_index=1)
+    await w.start()
+    try:
+        assert await asyncio.gather(f0, f1) == ["pcm-s1-c0", "pcm-s1-c1"]
+        assert len(t2w.batch_calls) == 2
+        assert t2w.batch_calls[0] == (["s1"], ["c0"])
+        assert t2w.batch_calls[1] == (["s1"], ["c1"])
+    finally:
+        await w.stop()
+
+
+@pytest.mark.asyncio
+async def test_packed_skips_cancelled_future():
+    """组批前已取消的 future 不进批，其余 job 正常成批执行。"""
+    t2w = FakeBatchT2W()
+    w = Token2WavWorker(t2w, mode="packed", max_batch=8)
+    f1 = w.submit_nowait("s1", "p1", chunk_index=0)
+    f2 = w.submit_nowait("s2", "p2", chunk_index=0)
+    f3 = w.submit_nowait("s3", "p3", chunk_index=0)
+    f2.cancel()
+    await w.start()
+    try:
+        assert await asyncio.gather(f1, f3) == ["pcm-s1-p1", "pcm-s3-p3"]
+        assert len(t2w.batch_calls) == 1
+        assert t2w.batch_calls[0][0] == ["s1", "s3"]
+    finally:
+        await w.stop()
+
+
+@pytest.mark.asyncio
+async def test_packed_batch_error_fails_whole_batch_worker_alive():
+    """批量调用抛错 → 整批 future 拿到异常（v1 可接受语义）；worker 存活。"""
+
+    class BoomBatch(FakeBatchT2W):
+        def __init__(self):
+            super().__init__()
+            self.fail_next = True
+
+        def stream_step_batched(self, sessions, plans):
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("batch boom")
+            return super().stream_step_batched(sessions, plans)
+
+    t2w = BoomBatch()
+    w = Token2WavWorker(t2w, mode="packed", max_batch=8)
+    f1 = w.submit_nowait("s1", "p1", chunk_index=0)
+    f2 = w.submit_nowait("s2", "p2", chunk_index=0)
+    await w.start()
+    try:
+        r1, r2 = await asyncio.gather(f1, f2, return_exceptions=True)
+        assert isinstance(r1, RuntimeError) and isinstance(r2, RuntimeError)
+        # worker 存活：后续 submit 正常
+        assert await w.submit("s3", "p3", chunk_index=0) == "pcm-s3-p3"
+    finally:
+        await w.stop()

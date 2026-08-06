@@ -61,7 +61,9 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         state.token2wav = CosyVoice3Token2Wav(
             model_dir, device=t2w_cfg.device,
             estimator_mode=t2w_cfg.estimator_mode)
-        state.batcher = Token2WavWorker(state.token2wav)
+        state.batcher = Token2WavWorker(state.token2wav,
+                                        mode=t2w_cfg.batch_mode,
+                                        max_batch=t2w_cfg.batch_size)
         state.voices = {}
         await state.batcher.start()
         await _warmup()
@@ -162,7 +164,14 @@ def main():
                    choices=["torch", "flashinfer"],
                    help="[M3] 流式 flow estimator（默认 torch；"
                         "flashinfer = chunk-causal mask fp16 路径）")
+    p.add_argument("--t2w-batch-mode", default="serial",
+                   choices=["serial", "packed"],
+                   help="[M3] token2wav 批量模式（packed = 跨 session "
+                        "flashinfer 批量，要求 --stream-estimator flashinfer）")
     args = p.parse_args()
+    if args.t2w_batch_mode == "packed" and args.stream_estimator != "flashinfer":
+        raise SystemExit("--t2w-batch-mode packed 要求 --stream-estimator "
+                         "flashinfer（torch estimator 无 packed 批量路径）")
 
     import os
     os.environ.setdefault("OMP_NUM_THREADS", "1")  # 同 offline 的 fork segfault 规避
@@ -171,7 +180,8 @@ def main():
                         gpu_memory_utilization=args.gpu_memory_utilization)
     t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
                               device=args.token2wav_device,
-                              estimator_mode=args.stream_estimator)
+                              estimator_mode=args.stream_estimator,
+                              batch_mode=args.t2w_batch_mode)
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s)
