@@ -154,6 +154,8 @@ def main():
     p.add_argument("--token2wav-dir", default="models/Fun-CosyVoice3-0.5B-2512")
     p.add_argument("--token2wav-device", default="cuda:0")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    p.add_argument("--request-timeout-s", type=float, default=300.0,
+                   help="非流式请求超时（spec §7；流式超时靠客户端）")
     args = p.parse_args()
 
     import os
@@ -165,7 +167,8 @@ def main():
                               device=args.token2wav_device,
                               estimator_mode="torch")
     server_cfg = ServerConfig(host=args.host, port=args.port,
-                              gpu_memory_utilization=args.gpu_memory_utilization)
+                              gpu_memory_utilization=args.gpu_memory_utilization,
+                              request_timeout_s=args.request_timeout_s)
     uvicorn.run(build_app(llm_cfg, t2w_cfg, server_cfg),
                 host=args.host, port=args.port, log_level="info")
 
