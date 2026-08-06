@@ -51,7 +51,7 @@ llm 加速比 4.56x。注意：SpeechSpec 参考值为 bs16 下 1.70x（全量 2
 解码行为本身对齐。
 RTF 为 (llm+t2w)/音频时长，不含 frontend。
 
-## Streaming server（M2）
+## Streaming server（M2+M3）
 
     bash scripts/run_server.sh --port 8000          # 启动（含引擎加载+warmup，~2分钟）
     # 流式请求（客户端示例，打印 TTFA/时长）：
@@ -66,12 +66,21 @@ RTF 为 (llm+t2w)/音频时长，不含 frontend。
     curl http://localhost:8000/v1/audio/voices
 
 协议：OpenAI `/v1/audio/speech`（扩展 `ref_audio`/`ref_text`/`seed`），`response_format` wav|pcm，
-`stream:true` 为增量 PCM（首包 44 字节未知长度 WAV 头）。v1 流式 token2wav 用 torch estimator
-（chunk-causal + 确定性重算；flashinfer 流式是 M3）；LLM 侧 DSpark 投机解码照常生效。
+`stream:true` 为增量 PCM（首包 44 字节未知长度 WAV 头）。流式 token2wav 默认走 flashinfer
+estimator（chunk-causal custom mask，fp16）+ 跨 session packed 批量（`--t2w-batch-mode packed`，
+batcher v2）；回退开关：`--stream-estimator torch --t2w-batch-mode serial`（M2 torch 路径，
+两者需同时指定）。LLM 侧 DSpark 投机解码照常生效。
 音色注册为内存态，重启即失。`--draft-model none` 关投机解码；`--gpu-memory-utilization` 默认 0.5。
 
-实测（H100，4 并发流式，e2e 测试输出）：server 侧 TTFA 稳态 286–494ms（并发首请求含
-frontend 处理约 0.5–1.1s）；ASR 门（CER≤0.15）流式/非流式 5/5 通过，同 seed 流式与非流式
-转写完全一致。交错回归测试锁定多 session bit-exact（tests/gpu/test_interleave.py）。
+实测（H100，e2e 测试 4 并发流式，同一提交顺序跑两轮）：
 
-M1 offline + M2 streaming server 已落地；M3（flashinfer 流式 mask + 跨请求 packed batch）见设计文档里程碑。
+| 配置 | server TTFA (ms) | client TTFA (ms) | 每请求 wall (s) |
+|---|---|---|---|
+| torch + serial（M2，回退） | 483 / 674 / 865 / 1059 | 923–1499 | 2.2–3.1 |
+| flashinfer + packed（M3，默认） | 350 / 468 / 463 / 466 | 640–753 | 0.8–1.1 |
+
+ASR 门（CER≤0.15）流式/非流式 5/5 通过（flashinfer+packed per-item CER 0.06–0.11），
+同 seed 流式与非流式转写一致。交错回归测试锁定多 session 确定性
+（tests/gpu/test_interleave.py、test_stream_flashinfer.py、test_stream_batched.py）。
+
+M1 offline + M2 streaming server + M3（flashinfer 流式 mask + 跨请求 packed batch）全部落地。
