@@ -1,5 +1,9 @@
+import sys
+
+import pytest
 import torch
-from faster_cosyvoice.token2wav.frontend import truncate_2to1, SpeakerCache
+from faster_cosyvoice.token2wav.frontend import (RefAudioFrontend,
+                                                 SpeakerCache, truncate_2to1)
 
 
 def test_truncate_2to1_feat_shorter():
@@ -27,3 +31,10 @@ def test_speaker_cache_lru_eviction():
     assert c.get("k1") == 1        # 触碰 k1
     c.put("k3", 3)                 # 淘汰 k2
     assert c.get("k2") is None and c.get("k1") == 1 and c.get("k3") == 3
+
+
+def test_campplus_trt_missing_tensorrt_fails_loud(monkeypatch):
+    """campplus_trt=True 且 tensorrt 不可 import → init 即抛可操作的 RuntimeError。"""
+    monkeypatch.setitem(sys.modules, "tensorrt", None)  # import 时抛 ImportError
+    with pytest.raises(RuntimeError, match="tensorrt"):
+        RefAudioFrontend("nonexistent/campplus.onnx", campplus_trt=True)

@@ -58,6 +58,8 @@ def get_args():
                    help="逗号分隔秒数（总时长 prompt+generated，如 "
                         "'8,12,16,20,24'）：开 batch=1 offline flow 的 "
                         "bucketed CUDA graphs；默认关")
+    p.add_argument("--campplus-trt", action="store_true",
+                   help="campplus 说话人 embedding 走 TensorRT（默认 ORT-CPU）")
     p.add_argument("--output-dir", default="results/offline")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -129,7 +131,8 @@ def main():
     codec = SpeechTokenCodec(tokenizer)
     llm = create_offline_llm(llm_cfg)
     frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
-                                device=t2w_cfg.device)
+                                device=t2w_cfg.device,
+                                campplus_trt=args.campplus_trt)
     buckets = ([float(s) for s in t2w_cfg.cuda_graph_buckets.split(",")]
                if t2w_cfg.cuda_graph_buckets else None)
     token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,

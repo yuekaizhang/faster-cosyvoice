@@ -5,6 +5,7 @@ speaker cache key = sha256(音频字节)+ref_text（修 triton 版按 ref_text �
 spec §5.2）。M1 offline 每行 ref 各不相同，cache 主要为 M2 server 铺路。
 """
 import hashlib
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
@@ -59,10 +60,22 @@ class SpeakerCache:
 
 class RefAudioFrontend:
     def __init__(self, campplus_onnx_path: str, device: str = "cuda:0",
-                 cache_size: int = 256):
+                 cache_size: int = 256, campplus_trt: bool = False):
+        self.device = device
+        # campplus TRT（opt-in；默认 ORT-CPU）。放最前：import/build 失败要在
+        # 任何重加载前 fail loud（campplus_trt._import_trt 给出可操作的报错）。
+        self._campplus_trt = None
+        if campplus_trt:
+            from faster_cosyvoice.token2wav import campplus_trt as _ctrt
+            device_id = torch.device(device).index or 0
+            plan_path = os.path.join(
+                os.path.dirname(campplus_onnx_path),
+                f"campplus.{device_id}.fp32.plan")
+            self._campplus_trt = _ctrt.load_campplus_trt(
+                campplus_onnx_path, plan_path, device=device)
+            self._spk_embedding_trt = _ctrt.spk_embedding_trt
         import onnxruntime
         import s3tokenizer
-        self.device = device
         self.audio_tokenizer = s3tokenizer.load_model(
             "speech_tokenizer_v3_25hz").to(device).eval()
         self._s3 = s3tokenizer
@@ -115,6 +128,9 @@ class RefAudioFrontend:
         feat = kaldi.fbank(wav_16k.unsqueeze(0), num_mel_bins=80, dither=0,
                            sample_frequency=16000)
         feat = feat - feat.mean(dim=0, keepdim=True)
+        if self._campplus_trt is not None:
+            return self._spk_embedding_trt(
+                self._campplus_trt, feat.to(self.device))
         emb = self.spk_model.run(
             None, {self.spk_model.get_inputs()[0].name:
                    feat.unsqueeze(0).cpu().numpy()})[0]
