@@ -232,19 +232,32 @@ class RaggedAttentionRunner:
             self._workspace, "NHD"
         )
         self._planned_key = None
-        self._mask_cache = {}  # [M3] flat chunk-causal masks, keyed like plans
+        # [M3] mask cache is single-slot, mirroring _planned_key: the plan
+        # cache itself is replace-on-change, so a multi-entry mask cache has
+        # no benefit and would retain O(T^2) GPU bool tensors forever (a
+        # streaming session growing 50->3000 frames ~= 60 keys, ~180MB).
+        self._mask_key = None
+        self._mask = None
 
     def _custom_mask(self, doc_lens, chunk_size):
-        """[M3] cached flat chunk-causal mask (saves ~1.3ms/chunk rebuild).
+        """[M3] single-slot cached flat chunk-causal mask (saves ~1.3ms
+        rebuild across the 10 euler steps; old mask freed by refcount).
         NOTE: we pass this as custom_mask, NEVER packed_custom_mask —
         flashinfer 0.6.13's packed_custom_mask path has a byte-vs-element
         unit mismatch for multi-doc ragged batches (wrong mask applied)."""
         key = (tuple(doc_lens), chunk_size)
-        mask = self._mask_cache.get(key)
-        if mask is None:
-            mask = _chunk_causal_flat_mask(doc_lens, chunk_size, self.device)
-            self._mask_cache[key] = mask
-        return mask
+        if key != self._mask_key:
+            if len(set(doc_lens)) == 1:
+                # equal-length docs (e.g. the b=2 CFG batch): build one
+                # T x T block and tile it instead of B identical blocks
+                block = _chunk_causal_flat_mask(
+                    doc_lens[:1], chunk_size, self.device)
+                self._mask = block.repeat(len(doc_lens))
+            else:
+                self._mask = _chunk_causal_flat_mask(
+                    doc_lens, chunk_size, self.device)
+            self._mask_key = key
+        return self._mask
 
     def plan(self, batch_size: int, seq_len: int, dtype: torch.dtype,
              chunk_size: Optional[int] = None):  # [M3] chunk-causal streaming
