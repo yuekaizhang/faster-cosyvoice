@@ -779,6 +779,14 @@ class FlashInferDiT(nn.Module):
 
     def _capture(self, b, n, dtype, bucket, stream=False):
         device = self.proj_out.weight.device
+        # [M3.5] pin the CUDA device for the whole capture: Stream()/
+        # current_stream()/CUDAGraph capture/synchronize() all target the
+        # CURRENT device — with --token2wav-device cuda:1 (LLM on cuda:0)
+        # the un-pinned version captures on the wrong device's stream.
+        with torch.cuda.device(device):
+            return self._capture_impl(b, n, dtype, bucket, stream, device)
+
+    def _capture_impl(self, b, n, dtype, bucket, stream, device):
         static = {
             "x": torch.zeros(b, 80, n, dtype=dtype, device=device),
             "mu": torch.zeros(b, 80, n, dtype=dtype, device=device),

@@ -50,7 +50,9 @@ def _enable_hift_compile(hift, device: str) -> None:
         return compiled(x=x, s=s, finalize=True)[:, :t * ratio]
 
     hift.decode = decode
-    with torch.inference_mode():
+    # [M3.5] pin device: inductor compiles/launches triton kernels on the
+    # CURRENT device — must match hift's device for --token2wav-device cuda:1.
+    with torch.inference_mode(), torch.cuda.device(device):
         for t in range(_HIFT_BUCKET, _HIFT_WARMUP_MAX + 1, _HIFT_BUCKET):
             mel = torch.zeros(1, 80, t, device=device) - 6.0
             hift.inference(speech_feat=mel, finalize=True)
@@ -116,6 +118,14 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         return wavs
 
     def _batch_impl(self, tokens_list, conds):
+        # [M3.5] triton (fused DiT tail / packed kernels / inductor hift) and
+        # flashinfer launch on the CURRENT cuda device, which is per-thread
+        # and defaults to cuda:0 — pin it to self.device so
+        # --token2wav-device cuda:1 works (also from the batcher's t2w thread).
+        with torch.cuda.device(self.device):
+            return self._batch_impl_pinned(tokens_list, conds)
+
+    def _batch_impl_pinned(self, tokens_list, conds):
         if self.estimator_mode == "flashinfer":
             from faster_cosyvoice.token2wav.flashinfer_dit import flow_inference_batched
             token_list = [c.prompt_tokens_flow + list(t)
@@ -165,6 +175,11 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         speech_offset 逻辑在 autocast 下不变。"""
         assert self.estimator_mode in ("torch", "flashinfer"), \
             self.estimator_mode
+        # [M3.5] device pin: see _batch_impl.
+        with torch.cuda.device(self.device):
+            return self._stream_step_pinned(session, plan)
+
+    def _stream_step_pinned(self, session, plan):
         cond = session.cond
         token = torch.tensor([session.tokens[:plan.prefix_len]],
                              device=self.device)
@@ -223,7 +238,9 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         emb = torch.stack([s.cond.spk_embedding
                            for s in sessions]).to(self.device)
         finalize_list = [p.finalize for p in plans]
-        mels = flow_inference_batched_streaming(
-            self.flow, token_list, prompt_feat_list, emb, finalize_list)
-        return [self._finish_chunk(s, p, mel)
-                for s, p, mel in zip(sessions, plans, mels)]
+        # [M3.5] device pin: see _batch_impl.
+        with torch.cuda.device(self.device):
+            mels = flow_inference_batched_streaming(
+                self.flow, token_list, prompt_feat_list, emb, finalize_list)
+            return [self._finish_chunk(s, p, mel)
+                    for s, p, mel in zip(sessions, plans, mels)]
