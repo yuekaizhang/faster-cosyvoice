@@ -32,6 +32,9 @@ class ChunkPlanner:
 
     def next_chunk(self, available_total: int,
                    finished: bool) -> Optional[ChunkPlan]:
+        """None 有两义：finished=False 时表示"等更多 token"；
+        finished=True 时表示"没有余量了"。调用方以
+        `finished and plan is None` 作为循环退出条件。"""
         available = available_total - self.emitted
         this_hop = self.hop + (self.pad if self.emitted == 0 else 0)
         if not finished:
