@@ -40,8 +40,9 @@ class Token2WavConfig:
     # 模板对本形状无 choice），fresh 仍 ~49ms；配合 pad-to-bucket 把长度空间收
     # 敛到少数桶（init warmup 预热到 1280 帧），全部命中 warm plan →
     # hift 整段 ~13-21ms（~3x）。一次性 warmup（编译+桶预热）~15-20s，init 付清。
-    # 波形 vs eager 数值差 ~8e-4（inductor 融合 + pad 改变 cudnn 算法选择；
-    # 质量门以 ASR CER 为准），默认关。
+    # 波形 vs eager 数值差：offline ~8e-4；流式逐 chunk 放大，worst-chunk
+    # ~6e-2（inductor 融合 + pad 改变 cudnn 算法选择；质量门以 ASR CER 为准，
+    # 若需要流式逐位稳定请保持关闭），默认关。
     hift_compile: bool = False
 
 

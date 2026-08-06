@@ -51,6 +51,18 @@ llm 加速比 4.56x。注意：SpeechSpec 参考值为 bs16 下 1.70x（全量 2
 解码行为本身对齐。
 RTF 为 (llm+t2w)/音频时长，不含 frontend。
 
+### 性能旋钮（opt-in，默认全关；26 条 batch=1 实测，H100）
+
+| 旋钮 | 作用 | 收益 |
+|---|---|---|
+| `--t2w-cuda-graph-buckets "8,12,16,20,24"` | batch=1 offline flow 分桶 CUDA graph | flow 54→44ms |
+| `--campplus-trt` | campplus 走 TensorRT（plan 磁盘缓存，首次构建 ~90s） | campplus 58→7ms |
+| `--hift-compile` | hift torch.compile + 64 帧长度桶（init warmup ~15-20s） | hift 48→13ms |
+
+三项全开：batch=1 每请求 e2e 301→219ms（26 条总墙钟 ~7s，RTF ~0.032）；ASR 门均通过。
+注意：`--hift-compile` 下波形与 eager 非逐位一致（offline ~8e-4，流式 worst-chunk ~6e-2），
+需要逐位稳定时保持关闭；batch≥8 时 flow 走 packed 批量，graph 桶自动不生效。
+
 ## Streaming server（M2+M3）
 
     bash scripts/run_server.sh --port 8000          # 启动（含引擎加载+warmup，~2分钟）

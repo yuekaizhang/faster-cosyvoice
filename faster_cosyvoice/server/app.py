@@ -171,7 +171,9 @@ def main():
                         "flashinfer 批量；要求 --stream-estimator flashinfer）")
     p.add_argument("--hift-compile", action="store_true",
                    help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
-                        "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）")
+                        "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）。"
+                        "注意：流式路径同走 compiled decode，波形与 eager 非逐位"
+                        "一致（worst-chunk ~6e-2，ASR CER 门通过）")
     args = p.parse_args()
     if args.t2w_batch_mode == "packed" and args.stream_estimator != "flashinfer":
         raise SystemExit("--t2w-batch-mode packed 要求 --stream-estimator "
