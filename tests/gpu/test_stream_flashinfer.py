@@ -3,7 +3,8 @@
 (a) 单实例跑通：ChunkPlanner 驱动 120 伪 token → 4 chunk、样本数与
     speech_offset 一致、总时长 > 3s。
 (b) 双 session 交错 vs 独跑（镜像 tests/gpu/test_interleave.py，但在
-    flashinfer 实例上）：优先 bit-exact，否则放宽 allclose(atol=1e-3)。
+    flashinfer 实例上）：严格 bit-exact（torch.equal）；若未来 flashinfer
+    升级导致回归，先核对失败信息里的 max-abs-diff 再考虑放宽（见内联注释）。
 运行：pytest tests/gpu/test_stream_flashinfer.py -m gpu -v（容器内）。"""
 import pytest
 import torch
