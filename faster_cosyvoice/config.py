@@ -29,3 +29,13 @@ class Token2WavConfig:
     device: str = "cuda:0"
     estimator_mode: str = "flashinfer"      # flashinfer | torch
     batch_size: int = 8                     # flashinfer packed 子批上限（防 OOM）
+
+
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 8000
+    gpu_memory_utilization: float = 0.5   # server 档（spec D6；与 token2wav 同卡）
+    max_ref_seconds: float = 30.0         # ref 音频超长截断并告警（spec §7）
+    request_timeout_s: float = 300.0
+    voice_cache_size: int = 256
