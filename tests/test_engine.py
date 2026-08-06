@@ -30,3 +30,26 @@ def test_draft_without_method_raises(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"block_size": 8}))
     with pytest.raises(ValueError):
         build_llm_kwargs(LLMConfig(target_model="m", draft_model=str(tmp_path)))
+
+
+from faster_cosyvoice.llm.engine import make_stream_sampling_params
+
+
+class FakeCodec:
+    eos_token_id = 158486
+
+
+def test_stream_sampling_params_dynamic_bounds():
+    sp = make_stream_sampling_params(LLMConfig(), FakeCodec(),
+                                     text_token_len=10, seed=7)
+    assert sp.min_tokens == 20                      # 2×text
+    assert sp.max_tokens == 200                     # min(2048, 20×text)
+    assert sp.stop_token_ids == [158486]
+    assert sp.detokenize is False
+    assert sp.seed == 7
+
+
+def test_stream_sampling_params_caps_at_2048():
+    sp = make_stream_sampling_params(LLMConfig(), FakeCodec(),
+                                     text_token_len=1000, seed=0)
+    assert sp.max_tokens == 2048
