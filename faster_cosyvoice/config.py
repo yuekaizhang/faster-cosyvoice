@@ -33,6 +33,16 @@ class Token2WavConfig:
     # 逗号分隔秒数字符串（总时长 prompt+generated，如 "8,12,16,20,24"）；
     # None=关。仅 offline batch=1（CFG 双行 b==2）走 bucketed CUDA graph。
     cuda_graph_buckets: Optional[str] = None
+    # opt-in torch.compile(hift.decode) + mel 长度 pad-to-bucket（64 帧粒度）：
+    # eager hift 每遇新 mel 长度要付一次 cudnn v8 plan-build（fresh-shape
+    # ~52-55ms/次，warm 同长度 ~19ms；每条请求 mel 长度都不同 → fresh 是常态）。
+    # 单纯 compile 不解决：inductor 的 conv1d 仍落回 ATen/cudnn（triton conv
+    # 模板对本形状无 choice），fresh 仍 ~49ms；配合 pad-to-bucket 把长度空间收
+    # 敛到少数桶（init warmup 预热到 1280 帧），全部命中 warm plan →
+    # hift 整段 ~13-21ms（~3x）。一次性 warmup（编译+桶预热）~15-20s，init 付清。
+    # 波形 vs eager 数值差 ~8e-4（inductor 融合 + pad 改变 cudnn 算法选择；
+    # 质量门以 ASR CER 为准），默认关。
+    hift_compile: bool = False
 
 
 @dataclass

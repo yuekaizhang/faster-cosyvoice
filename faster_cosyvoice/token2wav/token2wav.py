@@ -9,11 +9,61 @@ import torch
 
 from faster_cosyvoice.token2wav.builders import build_flow, build_hift
 
+# hift_compile 的 pad-to-bucket 粒度与 init warmup 覆盖上限（mel 帧，50Hz：
+# 64 帧 = 1.28s；1280 帧 = 25.6s 音频）。超过上限的桶首遇付一次 plan-build
+# （~45ms），之后同桶命中 warm。
+_HIFT_BUCKET = 64
+_HIFT_WARMUP_MAX = 1280
+
+
+def _enable_hift_compile(hift, device: str) -> None:
+    """opt-in：torch.compile(hift.decode, dynamic=True) + finalize=True 路径的
+    mel pad-to-bucket（见 Token2WavConfig.hift_compile 注释的量化结论）。
+
+    eager hift 每遇新 mel 长度付一次 cudnn v8 plan-build（fresh ~52-55ms，
+    warm ~19ms）；inductor 的 conv1d 仍落回 ATen/cudnn，单纯 compile 不解决
+    fresh 开销。pad-to-bucket 把长度空间收敛到少数桶 → 全部 warm，hift 整段
+    ~13-21ms。pad 用 0（decode 除 conv_pre 外全左因果，istft 尾帧不回灌），
+    截取 wav[:, :T*ratio] 保持输出长度不变；波形 vs eager ~8e-4（inductor
+    融合 + 桶长改变 cudnn 算法选择），质量门以 ASR CER 为准。
+
+    覆盖面：hift.inference（offline _batch_impl 与流式 _finish_chunk 都经它）
+    内部经 self.decode 属性查找调用 decode，实例属性覆盖即全路径生效。
+    finalize=False（流式非末 chunk）不 pad：conv_pre 的 look-right 尾帧是真实
+    lookahead，pad 会污染；且流式 mel 长度按 chunk 计划量化，天然可复用 warm
+    plan。一次性 warmup（编译 + 桶预热）~15-20s，由本函数在 init 付清。"""
+    eager_decode = hift.decode
+    compiled = torch.compile(eager_decode, dynamic=True)
+    # mel 帧 → s/wav 采样比（Fun-CosyVoice3：120*4=480，即 24kHz/50Hz）
+    import numpy as np
+    ratio = int(np.prod(hift.upsample_rates)) * hift.istft_params["hop_len"]
+
+    def decode(x, s=torch.zeros(1, 1, 0), finalize=True):
+        if not finalize or s.shape[2] == 0:
+            return compiled(x=x, s=s, finalize=finalize)
+        t = x.shape[2]
+        pad = (-t) % _HIFT_BUCKET
+        if pad == 0:
+            return compiled(x=x, s=s, finalize=True)
+        x = torch.nn.functional.pad(x, (0, pad))
+        s = torch.nn.functional.pad(s, (0, pad * ratio))
+        return compiled(x=x, s=s, finalize=True)[:, :t * ratio]
+
+    hift.decode = decode
+    with torch.inference_mode():
+        for t in range(_HIFT_BUCKET, _HIFT_WARMUP_MAX + 1, _HIFT_BUCKET):
+            mel = torch.zeros(1, 80, t, device=device) - 6.0
+            hift.inference(speech_feat=mel, finalize=True)
+        # 流式非末 chunk 分支（finalize=False）单独编译一次
+        hift.inference(speech_feat=torch.zeros(1, 80, 200, device=device) - 6.0,
+                       finalize=False)
+
 
 class CosyVoice3Token2Wav(torch.nn.Module):
     def __init__(self, model_dir: str, device: str = "cuda:0",
                  estimator_mode: str = "flashinfer",
-                 cuda_graph_buckets: Optional[list] = None):
+                 cuda_graph_buckets: Optional[list] = None,
+                 hift_compile: bool = False):
         super().__init__()
         self.device = device
         self.fp16 = False
@@ -28,6 +78,8 @@ class CosyVoice3Token2Wav(torch.nn.Module):
             weights_only=True).items()}
         self.hift.load_state_dict(hift_sd, strict=True)
         self.hift.to(device).eval()
+        if hift_compile:
+            _enable_hift_compile(self.hift, device)
 
         assert estimator_mode in ("flashinfer", "torch"), estimator_mode
         self.estimator_mode = estimator_mode

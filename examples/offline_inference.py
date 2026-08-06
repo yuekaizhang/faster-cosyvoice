@@ -60,6 +60,9 @@ def get_args():
                         "bucketed CUDA graphs；默认关")
     p.add_argument("--campplus-trt", action="store_true",
                    help="campplus 说话人 embedding 走 TensorRT（默认 ORT-CPU）")
+    p.add_argument("--hift-compile", action="store_true",
+                   help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
+                        "shape ~52ms → ~13-21ms；init 一次性 warmup ~15-20s）")
     p.add_argument("--output-dir", default="results/offline")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -112,7 +115,8 @@ def main():
                               device=args.token2wav_device,
                               estimator_mode=args.estimator,
                               batch_size=args.token2wav_batch_size,
-                              cuda_graph_buckets=args.t2w_cuda_graph_buckets)
+                              cuda_graph_buckets=args.t2w_cuda_graph_buckets,
+                              hift_compile=args.hift_compile)
 
     problems = check_environment(
         require_flashinfer=(args.estimator == "flashinfer"),
@@ -137,7 +141,8 @@ def main():
                if t2w_cfg.cuda_graph_buckets else None)
     token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,
                                     estimator_mode=t2w_cfg.estimator_mode,
-                                    cuda_graph_buckets=buckets)
+                                    cuda_graph_buckets=buckets,
+                                    hift_compile=t2w_cfg.hift_compile)
 
     metrics = dict(llm_wall_s=0.0, t2w_wall_s=0.0, frontend_wall_s=0.0,
                    output_tokens=0, finished_by_stop=0, failed=[])

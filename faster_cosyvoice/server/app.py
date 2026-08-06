@@ -60,7 +60,8 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
                                           cache_size=server_cfg.voice_cache_size)
         state.token2wav = CosyVoice3Token2Wav(
             model_dir, device=t2w_cfg.device,
-            estimator_mode=t2w_cfg.estimator_mode)
+            estimator_mode=t2w_cfg.estimator_mode,
+            hift_compile=t2w_cfg.hift_compile)
         state.batcher = Token2WavWorker(state.token2wav,
                                         mode=t2w_cfg.batch_mode,
                                         max_batch=t2w_cfg.batch_size)
@@ -168,6 +169,9 @@ def main():
                    choices=["serial", "packed"],
                    help="[M3] token2wav 批量模式（默认 packed = 跨 session "
                         "flashinfer 批量；要求 --stream-estimator flashinfer）")
+    p.add_argument("--hift-compile", action="store_true",
+                   help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
+                        "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）")
     args = p.parse_args()
     if args.t2w_batch_mode == "packed" and args.stream_estimator != "flashinfer":
         raise SystemExit("--t2w-batch-mode packed 要求 --stream-estimator "
@@ -183,7 +187,8 @@ def main():
     t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
                               device=args.token2wav_device,
                               estimator_mode=args.stream_estimator,
-                              batch_mode=args.t2w_batch_mode)
+                              batch_mode=args.t2w_batch_mode,
+                              hift_compile=args.hift_compile)
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s)
