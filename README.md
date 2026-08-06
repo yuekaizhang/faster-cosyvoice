@@ -63,6 +63,20 @@ RTF 为 (llm+t2w)/音频时长，不含 frontend。
 注意：`--hift-compile` 下波形与 eager 非逐位一致（offline ~8e-4，流式 worst-chunk ~6e-2），
 需要逐位稳定时保持关闭；batch≥8 时 flow 走 packed 批量，graph 桶自动不生效。
 
+流式 TTFP 旋钮（server，opt-in，默认关；单并发 H100 实测，同一 cached voice
+2 warmup + 5 runs 中位数）：
+
+| 旋钮 | 作用 | 收益 |
+|---|---|---|
+| `--stream-graph-buckets "512,640,768,896,1024,1280"` | 单 session 流式 flow 分桶 CUDA graph（mel 帧） | chunk-1 flow 89→67ms |
+| `--codec-chunk-frames 25 --codec-chunk-scale 1` | uniform-25 chunk（形状可枚举，配合上行） | — |
+
+两项 + `--hift-compile`：TTFP 160→149ms（无 LLM 抢占时 flow 89→23ms；流式 flow 与
+LLM 解码同卡并发，压缩空间被 SM 争抢部分吃掉）。graph 内 dense-SDPA 与 eager
+flashinfer 非逐位一致（mel corr ~0.985+；26 条流式 ASR mean CER 0.1127 vs offline
+基线 0.1078），需要逐位稳定请保持关闭。每 bucket 首遇 lazy capture ~25-100ms；
+首 chunk 长度 ≈ (prompt+pad+25)×2 帧（逐 voice 确定），建议在典型值附近配细桶。
+
 ## Streaming server（M2+M3）
 
     bash scripts/run_server.sh --port 8000          # 启动（含引擎加载+warmup，~2分钟）

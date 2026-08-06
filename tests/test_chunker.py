@@ -48,3 +48,27 @@ def test_zero_prompt_no_pad():
     p = ChunkPlanner(prompt_token_len=0)
     c = p.next_chunk(18, finished=False)
     assert (c.prefix_len, c.token_offset, c.finalize) == (18, 0, False)
+
+
+def test_uniform_mode():
+    """[M3.5-r2] uniform-25：chunk_size=25、scale=1 → hop 恒 25 不增长；
+    prompt 71 → pad=4 仅首块。chunk k 消费恒 +25 → flow 序列可枚举。"""
+    p = ChunkPlanner(prompt_token_len=71, chunk_size=25, scale=1)
+    assert p.pad == 4
+    # 首块：25+4+3=32 可用才发
+    assert p.next_chunk(31, finished=False) is None
+    c1 = p.next_chunk(32, finished=False)
+    assert (c1.prefix_len, c1.token_offset, c1.finalize) == (32, 0, False)
+    # 后续每块恒 hop=25（scale=1 不增长，max_hop 封顶不生效）
+    offsets = [29]
+    for k in range(3):
+        need = offsets[-1] + 25 + 3
+        assert p.next_chunk(need - 1, finished=False) is None
+        c = p.next_chunk(need, finished=False)
+        assert (c.prefix_len, c.token_offset, c.finalize) == (
+            need, offsets[-1], False)
+        offsets.append(offsets[-1] + 25)
+    # finalize 冲余量
+    c = p.next_chunk(offsets[-1] + 7, finished=True)
+    assert (c.prefix_len, c.token_offset, c.finalize) == (
+        offsets[-1] + 7, offsets[-1], True)

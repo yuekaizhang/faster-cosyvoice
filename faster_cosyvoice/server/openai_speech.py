@@ -57,8 +57,14 @@ async def synthesize_pcm(state, req: SpeechRequest,
     text_len = len(state.tokenizer.encode(req.input))
     sp = make_stream_sampling_params(state.llm_cfg, state.codec,
                                      text_len, req.seed)
+    # [M3.5-r2] chunk 参数来自 ServerConfig（默认 15/×2 = 现行行为；
+    # uniform-25 = frames=25, scale=1）。max_hop 走默认 4×chunk_size —
+    # scale=1 时 hop 恒为 chunk_size，封顶不生效。
     session = StreamSession(
-        cond=cond, planner=ChunkPlanner(len(cond.prompt_tokens_flow)))
+        cond=cond, planner=ChunkPlanner(
+            len(cond.prompt_tokens_flow),
+            chunk_size=state.server_cfg.codec_chunk_frames,
+            scale=state.server_cfg.codec_chunk_scale))
     request_id = str(uuid.uuid4())
     ttfa_ms = None
 

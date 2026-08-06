@@ -329,7 +329,8 @@ class FlashInferDiT(nn.Module):
                  mel_dim=80, mu_dim=80, spk_dim=80, out_channels=80,
                  enable_cuda_graph=False, cuda_graph_buckets=None,
                  device="cuda:0", static_chunk_size: int = 50,
-                 plan_cache_size: int = 4):
+                 plan_cache_size: int = 4,
+                 stream_graph_buckets: Optional[List[int]] = None):
         super().__init__()
         # [M3] chunk size for the streaming chunk-causal mask (mel frames,
         # = vendored DiT.static_chunk_size = token chunk 25 * mel ratio 2)
@@ -343,6 +344,17 @@ class FlashInferDiT(nn.Module):
         # mel frames (50 fps); buckets given in audio seconds
         self.cuda_graph_buckets = (
             sorted(int(d * 50) for d in cuda_graph_buckets) if cuda_graph_buckets else None
+        )
+        # [M3.5-r2] streaming bucketed CUDA graphs: buckets given directly in
+        # mel FRAMES (50 fps; streaming shapes are chunk-quantized, not
+        # duration-shaped). Only the b==2 single-session streaming CFG batch
+        # hits this path (packed batch>1 keeps the flashinfer ragged route).
+        # Dense-SDPA-in-graph is NOT bit-wise identical to the flashinfer
+        # ragged eager path — opt-in knob; the M3 bit-exact interleave gates
+        # keep running with this OFF. Quality arbiter: ASR CER gate.
+        self.stream_graph_buckets = (
+            sorted(int(n) for n in stream_graph_buckets)
+            if stream_graph_buckets else None
         )
 
         self.time_embed = TimestepEmbedding(dim)
@@ -374,7 +386,8 @@ class FlashInferDiT(nn.Module):
         self._finalized = False
         # triton fusion only pays off when its launcher overhead is hidden by
         # graph replay; eager mode keeps the native-kernel path
-        self._fused_tail = enable_cuda_graph and _HAS_TRITON
+        self._fused_tail = ((enable_cuda_graph or bool(stream_graph_buckets))
+                            and _HAS_TRITON)
         self._ln_mod = (_ln_modulate_triton if self._fused_tail
                         else _ln_modulate_torch)
 
@@ -466,6 +479,13 @@ class FlashInferDiT(nn.Module):
                 x.to(dtype), mu.to(dtype), spks.to(dtype), cond.to(dtype), t.to(dtype))
 
             b, _, seq_len = x.shape
+            # [M3.5-r2] streaming bucketed graphs: b==2 == ONE session's CFG
+            # pair (serial stream_step and packed B=1 both produce it), whose
+            # mask is all-ones → true length == seq_len. seq > max bucket
+            # falls through to the eager streaming path below.
+            if (streaming and b == 2 and self.stream_graph_buckets is not None
+                    and seq_len <= self.stream_graph_buckets[-1]):
+                return self._forward_graph_bucketed_stream(x, mu, t, spks, cond)
             # [M3] CUDA graphs capture a fixed (mask-free) plan: offline only
             if self.enable_cuda_graph and b == 2 and not streaming:
                 if self.cuda_graph_buckets is not None:
@@ -723,6 +743,27 @@ class FlashInferDiT(nn.Module):
         entry["pad_mask"][..., n:] = False
         return self._replay(entry, x, mu, t, spks, cond, n)
 
+    def _forward_graph_bucketed_stream(self, x, mu, t, spks, cond):
+        """[M3.5-r2] streaming bucket replay. For a padded bucket length N the
+        chunk-causal grid `k//C <= q//C` is position-only (CONSTANT per
+        bucket); the per-call variation is only the true-length key padding,
+        so the runtime mask update is `grid & (k < n)` written into the
+        static (1,1,N,N) bool buffer the captured SDPA reads (~N^2 bytes,
+        ~1MB at N=1024 — trivial vs the ~50ms of launch overhead removed).
+        Rows q >= n attend to a superset of keys but are sliced off by
+        _replay; both CFG docs share one true length so one mask broadcasts
+        over the batch dim."""
+        b, _, n = x.shape
+        bucket = next(s for s in self.stream_graph_buckets if s >= n)
+        key = ("sbucket", b, bucket)
+        entry = self._graph_cache.get(key)
+        if entry is None:
+            entry = self._capture(b, bucket, x.dtype, bucket=True, stream=True)
+            self._graph_cache[key] = entry
+        torch.logical_and(entry["grid"], entry["k_idx"] < n,
+                          out=entry["pad_mask"][0, 0])
+        return self._replay(entry, x, mu, t, spks, cond, n)
+
     def _replay(self, entry, x, mu, t, spks, cond, n):
         s = entry["x"]
         s["x"][:, :, :n].copy_(x)
@@ -736,7 +777,7 @@ class FlashInferDiT(nn.Module):
         entry["graph"].replay()
         return entry["out"][:, :, :n]
 
-    def _capture(self, b, n, dtype, bucket):
+    def _capture(self, b, n, dtype, bucket, stream=False):
         device = self.proj_out.weight.device
         static = {
             "x": torch.zeros(b, 80, n, dtype=dtype, device=device),
@@ -745,7 +786,19 @@ class FlashInferDiT(nn.Module):
             "t": torch.zeros(b, dtype=dtype, device=device),
             "spks": torch.zeros(b, 80, dtype=dtype, device=device),
         }
-        if bucket:
+        grid = k_idx = None
+        if bucket and stream:
+            # [M3.5-r2] streaming bucket: full 2D (1,1,N,N) mask buffer
+            # (chunk-causal grid needs per-query rows, unlike the offline
+            # key-padding (1,1,1,N)); grid/k_idx are kept for the runtime
+            # `grid & (k < n)` update in _forward_graph_bucketed_stream.
+            runner = None
+            idx = torch.arange(n, device=device)
+            grid = (idx.view(1, -1) // self._chunk_size
+                    <= idx.view(-1, 1) // self._chunk_size)
+            k_idx = idx.view(1, -1)
+            pad_mask = grid.clone().view(1, 1, n, n)
+        elif bucket:
             runner = None
             pad_mask = torch.ones(1, 1, 1, n, dtype=torch.bool, device=device)
         else:
@@ -768,7 +821,7 @@ class FlashInferDiT(nn.Module):
             out = self._forward_impl(static["x"], static["mu"], static["t"],
                                      static["spks"], static["cond"], runner, pad_mask)
         return {"graph": graph, "out": out, "x": static, "runner": runner,
-                "pad_mask": pad_mask}
+                "pad_mask": pad_mask, "grid": grid, "k_idx": k_idx}
 
 
 @torch.inference_mode()
@@ -984,7 +1037,8 @@ def token2wav_forward_batched(model, generated_speech_tokens_list,
     return wavs
 
 
-def apply_flashinfer(model, enable_cuda_graph=False, cuda_graph_buckets=None):
+def apply_flashinfer(model, enable_cuda_graph=False, cuda_graph_buckets=None,
+                     stream_graph_buckets=None):
     """Patch a CosyVoice3_Token2Wav instance: fp16 flow + flashinfer estimator."""
     model.flow.half()
     model.fp16 = True  # forward_flow autocast context, matching the TRT path
@@ -993,6 +1047,8 @@ def apply_flashinfer(model, enable_cuda_graph=False, cuda_graph_buckets=None):
 
     fi = FlashInferDiT(enable_cuda_graph=enable_cuda_graph,
                        cuda_graph_buckets=cuda_graph_buckets, device=str(device),
+                       # [M3.5-r2] streaming buckets in mel frames (opt-in)
+                       stream_graph_buckets=stream_graph_buckets,
                        # [M3] keep the streaming chunk in sync with the weights
                        static_chunk_size=getattr(ref, "static_chunk_size", 50))
     missing, unexpected = fi.load_state_dict(ref.state_dict(), strict=False)

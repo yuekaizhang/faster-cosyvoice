@@ -63,7 +63,8 @@ class CosyVoice3Token2Wav(torch.nn.Module):
     def __init__(self, model_dir: str, device: str = "cuda:0",
                  estimator_mode: str = "flashinfer",
                  cuda_graph_buckets: Optional[list] = None,
-                 hift_compile: bool = False):
+                 hift_compile: bool = False,
+                 stream_graph_buckets: Optional[list] = None):
         super().__init__()
         self.device = device
         self.fp16 = False
@@ -87,12 +88,21 @@ class CosyVoice3Token2Wav(torch.nn.Module):
             from faster_cosyvoice.token2wav.flashinfer_dit import apply_flashinfer
             # cuda_graph_buckets：秒数列表（总时长 prompt+generated），开启
             # duration-bucketed CUDA graphs。仅 offline batch=1（CFG 双行
-            # b==2、streaming=False）命中 graph 分支；流式被 M3 gate 排除，
-            # packed batch>1（b==2B>2）仍走 packed varlen 路径。
+            # b==2、streaming=False）命中 graph 分支；packed batch>1
+            # （b==2B>2）仍走 packed varlen 路径。
+            # stream_graph_buckets [M3.5-r2]：mel 帧数列表（如
+            # [512,640,768,896,1024,1280]），开启流式 bucketed CUDA graphs —
+            # 仅单 session 流式（CFG 双行 b==2、streaming=True）命中；graph 内
+            # 为 dense-SDPA + 运行时 chunk-causal&len 掩码，与 eager
+            # flashinfer ragged 非逐位一致（opt-in；质量门 = ASR CER）。
+            # 每 bucket 首遇 lazy capture ~100ms；chunk-k 的 flow 序列长
+            # = (prompt+pad+consumed_tokens)*2 帧，逐 voice 确定 → 建议给
+            # 典型首 chunk 长度附近配一个细 bucket 保 TTFP。
             apply_flashinfer(
                 self,
                 enable_cuda_graph=bool(cuda_graph_buckets),
                 cuda_graph_buckets=cuda_graph_buckets,
+                stream_graph_buckets=stream_graph_buckets,
             )  # flow→fp16、estimator 替换、self.fp16=True
 
     @torch.inference_mode()

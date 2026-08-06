@@ -1,5 +1,5 @@
 # tests/test_config.py
-from faster_cosyvoice.config import LLMConfig, Token2WavConfig
+from faster_cosyvoice.config import LLMConfig, ServerConfig, Token2WavConfig
 
 
 def test_llm_defaults_match_spec_appendix_a():
@@ -19,3 +19,12 @@ def test_token2wav_defaults():
     assert c.batch_size == 8
     assert c.cuda_graph_buckets is None  # 默认关：opt-in bucketed CUDA graphs
     assert c.hift_compile is False  # 默认关：opt-in torch.compile(hift.decode)
+    # [M3.5-r2] 默认关：opt-in 流式 bucketed CUDA graphs
+    assert c.stream_graph_buckets is None
+
+
+def test_server_chunk_defaults_match_current_behavior():
+    """[M3.5-r2] 默认 15/×2 = M3 现行 ChunkPlanner 行为（growth 测试覆盖）。"""
+    c = ServerConfig()
+    assert c.codec_chunk_frames == 15
+    assert c.codec_chunk_scale == 2

@@ -59,10 +59,14 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
                                           device=t2w_cfg.device,
                                           cache_size=server_cfg.voice_cache_size,
                                           campplus_trt=t2w_cfg.campplus_trt)
+        stream_buckets = ([int(v) for v in
+                           t2w_cfg.stream_graph_buckets.split(",")]
+                          if t2w_cfg.stream_graph_buckets else None)
         state.token2wav = CosyVoice3Token2Wav(
             model_dir, device=t2w_cfg.device,
             estimator_mode=t2w_cfg.estimator_mode,
-            hift_compile=t2w_cfg.hift_compile)
+            hift_compile=t2w_cfg.hift_compile,
+            stream_graph_buckets=stream_buckets)
         state.batcher = Token2WavWorker(state.token2wav,
                                         mode=t2w_cfg.batch_mode,
                                         max_batch=t2w_cfg.batch_size)
@@ -175,6 +179,20 @@ def main():
                         "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）。"
                         "注意：流式路径同走 compiled decode，波形与 eager 非逐位"
                         "一致（worst-chunk ~6e-2，ASR CER 门通过）")
+    p.add_argument("--stream-graph-buckets", default=None,
+                   help="[M3.5-r2] 流式 bucketed CUDA graphs：逗号分隔 mel 帧数"
+                        "（如 \"512,640,768,896,1024,1280\"）。仅单 session "
+                        "流式命中；dense-SDPA graph 与 eager 非逐位一致"
+                        "（ASR CER 门为准）。每 bucket 首遇 capture ~100ms；"
+                        "warmup 会预热 warmup voice 命中的桶。建议配合 "
+                        "--codec-chunk-frames 25 --codec-chunk-scale 1 "
+                        "（chunk 形状可枚举）")
+    p.add_argument("--codec-chunk-frames", type=int, default=15,
+                   help="[M3.5-r2] ChunkPlanner chunk_size（token 数；默认 15 "
+                        "= 现行行为；uniform-25 模式设 25）")
+    p.add_argument("--codec-chunk-scale", type=int, default=2,
+                   help="[M3.5-r2] hop 逐块放大倍率（默认 2 = 现行 ×2 growth；"
+                        "1 = uniform hop，chunk 形状可枚举）")
     p.add_argument("--campplus-trt", action="store_true",
                    help="campplus 说话人 embedding 走 TensorRT（冷 ref resolve "
                         "88.6→23.3ms，spk_emb ~58→~7ms）。首启无 plan 缓存时 "
@@ -196,10 +214,13 @@ def main():
                               estimator_mode=args.stream_estimator,
                               batch_mode=args.t2w_batch_mode,
                               hift_compile=args.hift_compile,
-                              campplus_trt=args.campplus_trt)
+                              campplus_trt=args.campplus_trt,
+                              stream_graph_buckets=args.stream_graph_buckets)
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
-                              request_timeout_s=args.request_timeout_s)
+                              request_timeout_s=args.request_timeout_s,
+                              codec_chunk_frames=args.codec_chunk_frames,
+                              codec_chunk_scale=args.codec_chunk_scale)
     uvicorn.run(build_app(llm_cfg, t2w_cfg, server_cfg),
                 host=args.host, port=args.port, log_level="info")
 

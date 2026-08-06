@@ -33,6 +33,16 @@ class Token2WavConfig:
     # 逗号分隔秒数字符串（总时长 prompt+generated，如 "8,12,16,20,24"）；
     # None=关。仅 offline batch=1（CFG 双行 b==2）走 bucketed CUDA graph。
     cuda_graph_buckets: Optional[str] = None
+    # [M3.5-r2] 流式 bucketed CUDA graphs：逗号分隔 mel 帧数（50fps，如
+    # "512,640,768,896,1024,1280"）；None=关。仅单 session 流式（CFG 双行
+    # b==2、streaming=True）命中：graph 内 dense-SDPA + 运行时
+    # chunk-causal&true-len 掩码，与 eager flashinfer ragged 非逐位一致
+    # （opt-in；质量门 = ASR CER）。chunk-k flow 序列 =
+    # (prompt+pad+consumed)*2 帧，逐 voice 确定：首 chunk（uniform-25 下
+    # ≈(prompt+pad+25)*2）附近配一个细 bucket 保 TTFP。每 bucket 首遇 lazy
+    # capture ~100ms（server warmup 会预热 warmup voice 命中的桶；真实 voice
+    # prompt 长度不同 → 每桶首个真实请求付一次 capture）。
+    stream_graph_buckets: Optional[str] = None
     # opt-in torch.compile(hift.decode) + mel 长度 pad-to-bucket（64 帧粒度）：
     # eager hift 每遇新 mel 长度要付一次 cudnn v8 plan-build（fresh-shape
     # ~52-55ms/次，warm 同长度 ~19ms；每条请求 mel 长度都不同 → fresh 是常态）。
@@ -58,3 +68,9 @@ class ServerConfig:
     max_ref_seconds: float = 30.0         # ref 音频超长截断并告警（spec §7）
     request_timeout_s: float = 300.0
     voice_cache_size: int = 256
+    # [M3.5-r2] ChunkPlanner 参数（默认 = 现行 15/×2 growth 行为）。
+    # uniform-25 模式：codec_chunk_frames=25 + codec_chunk_scale=1 → 每 chunk
+    # 恒定 25 token（hop 不增长），TTFP 中性、chunk 形状可枚举
+    # （+50 mel 帧/chunk，逐 voice 确定），配合 stream_graph_buckets 使用。
+    codec_chunk_frames: int = 15
+    codec_chunk_scale: int = 2
