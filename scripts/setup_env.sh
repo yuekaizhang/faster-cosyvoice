@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 分层复用 vllm025_venv（vllm 0.25.1 wheel，dspark 内置），不重装 vllm。
-# 产出：本仓 venv/（py3.12 + datasets/soundfile/pytest + .pth 指向 vllm025 site-packages）
+# 产出：本仓 venv/（py3.12 + requirements.txt extras + .pth 指向 vllm025 site-packages）
 #       third_party/spec-vllm（yuekaizhang/vllm fork 源码，rep-penalty mirror，盖 PYTHONPATH）
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -15,7 +15,7 @@ if [ ! -d "$PWD/venv" ]; then
 fi
 # 把 vllm025 的 site-packages 挂进我们的 venv（.pth，排在 PYTHONPATH 之后、可被 fork 覆盖）
 echo "$V025_SITE" > venv/lib/python3.12/site-packages/_vllm025.pth
-uv pip install --python venv/bin/python datasets soundfile pytest
+uv pip install --python venv/bin/python -r requirements.txt
 
 # rep-penalty mirror（vllm PR #48932 合并前必需）：fork 源码盖在 wheel 之上
 # github 不可达时可用本地镜像：
