@@ -459,6 +459,11 @@ class FlashInferDiT(nn.Module):
                 torch.arange(l, device=device, dtype=torch.int32) for l in lens])
             meta = {"pack_idx": pack_idx, "doc_ids": doc_ids, "pos_ids": pos_ids,
                     "lens": lens}
+            # [M3] 有界化：流式 packed 模式下前缀逐 chunk 增长 × 批组成多样，
+            # key 空间比 offline 大得多（~100KB/key 的 GPU 索引张量会无限累积）。
+            # FIFO 淘汰足够——命中模式以"最近形状"为主，与 mask/plan 单槽同理。
+            if len(self._pack_cache) >= 64:
+                self._pack_cache.pop(next(iter(self._pack_cache)))
             self._pack_cache[key] = meta
         self.attn_runner.plan_docs(
             meta["lens"], x.dtype,
