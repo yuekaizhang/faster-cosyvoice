@@ -209,6 +209,19 @@ def _gate_ln_modulate(h, gate, y, shift, scale, eps=1e-6):
     return h_out, norm_out
 
 
+def _chunk_causal_flat_mask(doc_lens, chunk_size: int, device) -> torch.Tensor:
+    """[M3] per-doc row-major chunk-causal bool mask, flattened and
+    concatenated in doc order (flashinfer custom_mask layout, True=keep).
+    Predicate allowed(q,k) = k//chunk <= q//chunk, equivalent to the vendored
+    subsequent_chunk_mask (cf. dit.py streaming branch, dit.py:163)."""
+    parts = []
+    for n in doc_lens:
+        idx = torch.arange(n, device=device)
+        parts.append((idx.view(1, -1) // chunk_size
+                      <= idx.view(-1, 1) // chunk_size).flatten())
+    return torch.cat(parts)
+
+
 class RaggedAttentionRunner:
     def __init__(self, num_heads, head_dim, device, workspace_size=_WORKSPACE_SIZE):
         self.num_heads = num_heads
@@ -219,32 +232,54 @@ class RaggedAttentionRunner:
             self._workspace, "NHD"
         )
         self._planned_key = None
+        self._mask_cache = {}  # [M3] flat chunk-causal masks, keyed like plans
 
-    def plan(self, batch_size: int, seq_len: int, dtype: torch.dtype):
-        key = (batch_size, seq_len, dtype)
+    def _custom_mask(self, doc_lens, chunk_size):
+        """[M3] cached flat chunk-causal mask (saves ~1.3ms/chunk rebuild).
+        NOTE: we pass this as custom_mask, NEVER packed_custom_mask —
+        flashinfer 0.6.13's packed_custom_mask path has a byte-vs-element
+        unit mismatch for multi-doc ragged batches (wrong mask applied)."""
+        key = (tuple(doc_lens), chunk_size)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = _chunk_causal_flat_mask(doc_lens, chunk_size, self.device)
+            self._mask_cache[key] = mask
+        return mask
+
+    def plan(self, batch_size: int, seq_len: int, dtype: torch.dtype,
+             chunk_size: Optional[int] = None):  # [M3] chunk-causal streaming
+        key = (batch_size, seq_len, dtype, chunk_size)  # [M3] key incl. chunk
         if key == self._planned_key:
             return
         indptr = torch.arange(0, (batch_size + 1) * seq_len, seq_len,
                               dtype=torch.int32, device=self.device)
+        kwargs = {}
+        if chunk_size is not None:  # [M3]
+            kwargs["custom_mask"] = self._custom_mask(
+                [seq_len] * batch_size, chunk_size)
         self.wrapper.plan(
             indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
             causal=False, sm_scale=self.head_dim ** -0.5,
-            q_data_type=dtype, kv_data_type=dtype,
+            q_data_type=dtype, kv_data_type=dtype, **kwargs,
         )
         self._planned_key = key
 
-    def plan_docs(self, doc_lens: List[int], dtype: torch.dtype):
+    def plan_docs(self, doc_lens: List[int], dtype: torch.dtype,
+                  chunk_size: Optional[int] = None):  # [M3]
         """Plan for variable-length packed documents."""
-        key = (tuple(doc_lens), dtype)
+        key = (tuple(doc_lens), dtype, chunk_size)  # [M3] key incl. chunk
         if key == self._planned_key:
             return
         indptr = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=self.device)
         indptr[1:] = torch.cumsum(
             torch.tensor(doc_lens, dtype=torch.int32, device=self.device), dim=0)
+        kwargs = {}
+        if chunk_size is not None:  # [M3]
+            kwargs["custom_mask"] = self._custom_mask(doc_lens, chunk_size)
         self.wrapper.plan(
             indptr, indptr, self.num_heads, self.num_heads, self.head_dim,
             causal=False, sm_scale=self.head_dim ** -0.5,
-            q_data_type=dtype, kv_data_type=dtype,
+            q_data_type=dtype, kv_data_type=dtype, **kwargs,
         )
         self._planned_key = key
 
@@ -262,8 +297,11 @@ class FlashInferDiT(nn.Module):
     def __init__(self, dim=1024, depth=22, heads=16, dim_head=64, ff_mult=2,
                  mel_dim=80, mu_dim=80, spk_dim=80, out_channels=80,
                  enable_cuda_graph=False, cuda_graph_buckets=None,
-                 device="cuda:0"):
+                 device="cuda:0", static_chunk_size: int = 50):
         super().__init__()
+        # [M3] chunk size for the streaming chunk-causal mask (mel frames,
+        # = vendored DiT.static_chunk_size = token chunk 25 * mel ratio 2)
+        self._chunk_size = static_chunk_size
         self.dim = dim
         self.depth = depth
         self.heads = heads
@@ -350,7 +388,7 @@ class FlashInferDiT(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, x, mask, mu, t, spks=None, cond=None, streaming=False):
-        assert not streaming, "flashinfer estimator supports the offline path only"
+        # [M3] streaming supported via chunk-causal custom mask (no assert)
         # run in pure fp16 regardless of the caller's autocast (like the TRT engine)
         with torch.autocast(device_type="cuda", enabled=False):
             dtype = self.proj_out.weight.dtype
@@ -358,7 +396,8 @@ class FlashInferDiT(nn.Module):
                 x.to(dtype), mu.to(dtype), spks.to(dtype), cond.to(dtype), t.to(dtype))
 
             b, _, seq_len = x.shape
-            if self.enable_cuda_graph and b == 2:
+            # [M3] CUDA graphs capture a fixed (mask-free) plan: offline only
+            if self.enable_cuda_graph and b == 2 and not streaming:
                 if self.cuda_graph_buckets is not None:
                     return self._forward_graph_bucketed(x, mu, t, spks, cond)
                 return self._forward_graph(x, mu, t, spks, cond)
@@ -366,12 +405,15 @@ class FlashInferDiT(nn.Module):
                 # packed varlen path: fastest no-graph route even at b=2
                 # (single-sample CFG) — fused triton kernels amortize their
                 # launcher cost over far fewer total launches
-                return self._forward_packed(x, mask, mu, t, spks, cond)
+                return self._forward_packed(x, mask, mu, t, spks, cond,
+                                            streaming=streaming)  # [M3]
 
-            self.attn_runner.plan(b, seq_len, dtype)
+            self.attn_runner.plan(
+                b, seq_len, dtype,
+                chunk_size=self._chunk_size if streaming else None)  # [M3]
             return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
 
-    def _forward_packed(self, x, mask, mu, t, spks, cond):
+    def _forward_packed(self, x, mask, mu, t, spks, cond, streaming=False):
         """Batch>1 path: padded (2B, 80, maxT) rows are packed into one
         varlen sequence (total real tokens) for the transformer stack —
         zero padding compute, exact ragged attention per document."""
@@ -394,7 +436,9 @@ class FlashInferDiT(nn.Module):
             meta = {"pack_idx": pack_idx, "doc_ids": doc_ids, "pos_ids": pos_ids,
                     "lens": lens}
             self._pack_cache[key] = meta
-        self.attn_runner.plan_docs(meta["lens"], x.dtype)
+        self.attn_runner.plan_docs(
+            meta["lens"], x.dtype,
+            chunk_size=self._chunk_size if streaming else None)  # [M3]
 
         # input embedding on the padded layout (cheap; causal conv is
         # pad-safe since padding sits at the tail of each row)
@@ -774,7 +818,9 @@ def apply_flashinfer(model, enable_cuda_graph=False, cuda_graph_buckets=None):
     device = next(ref.parameters()).device
 
     fi = FlashInferDiT(enable_cuda_graph=enable_cuda_graph,
-                       cuda_graph_buckets=cuda_graph_buckets, device=str(device))
+                       cuda_graph_buckets=cuda_graph_buckets, device=str(device),
+                       # [M3] keep the streaming chunk in sync with the weights
+                       static_chunk_size=getattr(ref, "static_chunk_size", 50))
     missing, unexpected = fi.load_state_dict(ref.state_dict(), strict=False)
     missing = [k for k in missing if "rope" not in k]
     assert not missing and not unexpected, f"state_dict mismatch: {missing} {unexpected}"
