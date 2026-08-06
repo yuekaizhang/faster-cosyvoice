@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -62,9 +63,12 @@ async def _stream_one(client, ref_url, ref_text, text, idx):
 def test_server_streaming_e2e():
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT, exist_ok=True)
+    # [M3] FCV_E2E_SERVER_ARGS：附加 server 启动参数（如
+    # "--stream-estimator flashinfer --t2w-batch-mode packed"），默认空。
+    extra = shlex.split(os.environ.get("FCV_E2E_SERVER_ARGS", ""))
     proc = subprocess.Popen(
         [sys.executable, "-m", "faster_cosyvoice.server.app",
-         "--port", str(PORT)])
+         "--port", str(PORT), *extra])
     try:
         # 等 server ready（warmup 含引擎加载，给足时间）
         deadline = time.time() + 900
