@@ -23,6 +23,7 @@ Usage:
     apply_flashinfer(model, enable_cuda_graph=True)
 """
 import math
+from collections import OrderedDict
 from typing import List, Optional
 
 import torch
@@ -232,12 +233,16 @@ class RaggedAttentionRunner:
             self._workspace, "NHD"
         )
         self._planned_key = None
-        # [M3] mask cache is single-slot, mirroring _planned_key: the plan
-        # cache itself is replace-on-change, so a multi-entry mask cache has
-        # no benefit and would retain O(T^2) GPU bool tensors forever (a
-        # streaming session growing 50->3000 frames ~= 60 keys, ~180MB).
+        # [M3.5] each runner serves ONE plan key at a time (the flashinfer
+        # wrapper holds a single plan internally), so its mask cache stays
+        # single-slot; multi-key reuse is handled one level up by the
+        # FlashInferDiT runner pool (see _planned_runner), which keeps whole
+        # ready-planned runners alive instead of caching masks alone —
+        # profiling showed the mask build is only ~2.4ms of the ~17ms
+        # chunk-1 plan_docs; the other ~14ms is wrapper.plan() itself.
         self._mask_key = None
         self._mask = None
+        self.plan_calls = 0  # [M3.5] actual (non-no-op) plans; test/profiling hook
 
     def _custom_mask(self, doc_lens, chunk_size):
         """[M3] single-slot cached flat chunk-causal mask (saves ~1.3ms
@@ -264,6 +269,7 @@ class RaggedAttentionRunner:
         key = (batch_size, seq_len, dtype, chunk_size)  # [M3] key incl. chunk
         if key == self._planned_key:
             return
+        self.plan_calls += 1  # [M3.5]
         indptr = torch.arange(0, (batch_size + 1) * seq_len, seq_len,
                               dtype=torch.int32, device=self.device)
         kwargs = {}
@@ -291,6 +297,7 @@ class RaggedAttentionRunner:
         key = (tuple(doc_lens), dtype, chunk_size)  # [M3] key incl. chunk
         if key == self._planned_key:
             return
+        self.plan_calls += 1  # [M3.5]
         indptr = torch.zeros(len(doc_lens) + 1, dtype=torch.int32, device=self.device)
         indptr[1:] = torch.cumsum(
             torch.tensor(doc_lens, dtype=torch.int32, device=self.device), dim=0)
@@ -321,7 +328,8 @@ class FlashInferDiT(nn.Module):
     def __init__(self, dim=1024, depth=22, heads=16, dim_head=64, ff_mult=2,
                  mel_dim=80, mu_dim=80, spk_dim=80, out_channels=80,
                  enable_cuda_graph=False, cuda_graph_buckets=None,
-                 device="cuda:0", static_chunk_size: int = 50):
+                 device="cuda:0", static_chunk_size: int = 50,
+                 plan_cache_size: int = 4):
         super().__init__()
         # [M3] chunk size for the streaming chunk-causal mask (mel frames,
         # = vendored DiT.static_chunk_size = token chunk 25 * mel ratio 2)
@@ -347,7 +355,20 @@ class FlashInferDiT(nn.Module):
         self.norm_out = AdaLayerNormZero_Final(dim)
         self.proj_out = nn.Linear(dim, mel_dim)
 
-        self.attn_runner = RaggedAttentionRunner(heads, dim_head, torch.device(device))
+        # [M3.5] pooled plan cache: the flashinfer wrapper holds ONE plan, so
+        # reusing a plan across keys requires one WRAPPER (runner) per key.
+        # Streaming chunk keys recur across requests (per-voice deterministic
+        # shapes) but the old single runner replanned chunk-1 EVERY request —
+        # later chunks of each request evicted its entry (~17ms/request:
+        # ~14ms wrapper.plan host sync + ~2.4ms mask build). Bounded FIFO of
+        # ready-planned runners, keyed by plan key; evicted runners are
+        # RECYCLED (their 64MB workspace is reused, only replanned).
+        # Memory: plan_cache_size=4 × 64MB workspace = 256MB (+ each runner's
+        # single-slot mask, ~2*T^2 bool worst case). plan_cache_size=1
+        # degenerates to the old single-runner replan-on-change behavior.
+        self._plan_cache_size = max(1, plan_cache_size)
+        self._runner_pool: OrderedDict = OrderedDict()  # plan key -> runner
+        self._runner_device = torch.device(device)
         self._graph_cache = {}
         self._pack_cache = {}
         self._finalized = False
@@ -356,6 +377,31 @@ class FlashInferDiT(nn.Module):
         self._fused_tail = enable_cuda_graph and _HAS_TRITON
         self._ln_mod = (_ln_modulate_triton if self._fused_tail
                         else _ln_modulate_torch)
+
+    # ------------------------------------------------------------------
+    # [M3.5] pooled plan cache (see __init__ comment)
+    def _pooled_runner(self, key):
+        r = self._runner_pool.get(key)
+        if r is None:
+            if len(self._runner_pool) >= self._plan_cache_size:
+                # FIFO evict + recycle: reuse the evicted runner's workspace;
+                # its stale _planned_key won't match, so plan() below replans.
+                _, r = self._runner_pool.popitem(last=False)
+            else:
+                r = RaggedAttentionRunner(self.heads, self.dim_head,
+                                          self._runner_device)
+            self._runner_pool[key] = r
+        return r
+
+    def _planned_runner(self, batch_size, seq_len, dtype, chunk_size=None):
+        r = self._pooled_runner(("bs", batch_size, seq_len, dtype, chunk_size))
+        r.plan(batch_size, seq_len, dtype, chunk_size=chunk_size)  # no-op on hit
+        return r
+
+    def _planned_runner_docs(self, doc_lens, dtype, chunk_size=None):
+        r = self._pooled_runner(("docs", tuple(doc_lens), dtype, chunk_size))
+        r.plan_docs(doc_lens, dtype, chunk_size=chunk_size)  # no-op on hit
+        return r
 
     def finalize_weights(self):
         """Derive fused inference weights; call once after load + cast."""
@@ -432,10 +478,10 @@ class FlashInferDiT(nn.Module):
                 return self._forward_packed(x, mask, mu, t, spks, cond,
                                             streaming=streaming)  # [M3]
 
-            self.attn_runner.plan(
+            runner = self._planned_runner(
                 b, seq_len, dtype,
                 chunk_size=self._chunk_size if streaming else None)  # [M3]
-            return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
+            return self._forward_impl(x, mu, t, spks, cond, runner, None)
 
     def _forward_packed(self, x, mask, mu, t, spks, cond, streaming=False):
         """Batch>1 path: padded (2B, 80, maxT) rows are packed into one
@@ -465,7 +511,7 @@ class FlashInferDiT(nn.Module):
             if len(self._pack_cache) >= 64:
                 self._pack_cache.pop(next(iter(self._pack_cache)))
             self._pack_cache[key] = meta
-        self.attn_runner.plan_docs(
+        runner = self._planned_runner_docs(
             meta["lens"], x.dtype,
             chunk_size=self._chunk_size if streaming else None)  # [M3]
 
@@ -516,7 +562,7 @@ class FlashInferDiT(nn.Module):
             _qkv_rope_repack_packed_kernel[(total,)](
                 qkv, q, k, v, self._rope_cos32, self._rope_sin32, pos_ids, n_dim)
             attn_out = attn.to_out[0](
-                self.attn_runner.wrapper.run(q, k, v).reshape(total, n_dim))
+                runner.wrapper.run(q, k, v).reshape(total, n_dim))
             hp, ffn_in = gate_ln(hp, gate_msa, attn_out, shift_mlp, scale_mlp)
             ff_out = block.ff(ffn_in)
             if i + 1 < self.depth:
@@ -666,8 +712,8 @@ class FlashInferDiT(nn.Module):
         b, _, n = x.shape
         bucket = next((s for s in self.cuda_graph_buckets if s >= n), None)
         if bucket is None:  # longer than the largest bucket: eager fallback
-            self.attn_runner.plan(b, n, x.dtype)
-            return self._forward_impl(x, mu, t, spks, cond, self.attn_runner, None)
+            runner = self._planned_runner(b, n, x.dtype)
+            return self._forward_impl(x, mu, t, spks, cond, runner, None)
         key = ("bucket", b, bucket)
         entry = self._graph_cache.get(key)
         if entry is None:

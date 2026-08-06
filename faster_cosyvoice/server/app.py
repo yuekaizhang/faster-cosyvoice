@@ -57,7 +57,8 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         state.engine = create_async_llm(llm_cfg)
         state.frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
                                           device=t2w_cfg.device,
-                                          cache_size=server_cfg.voice_cache_size)
+                                          cache_size=server_cfg.voice_cache_size,
+                                          campplus_trt=t2w_cfg.campplus_trt)
         state.token2wav = CosyVoice3Token2Wav(
             model_dir, device=t2w_cfg.device,
             estimator_mode=t2w_cfg.estimator_mode,
@@ -174,6 +175,10 @@ def main():
                         "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）。"
                         "注意：流式路径同走 compiled decode，波形与 eager 非逐位"
                         "一致（worst-chunk ~6e-2，ASR CER 门通过）")
+    p.add_argument("--campplus-trt", action="store_true",
+                   help="campplus 说话人 embedding 走 TensorRT（冷 ref resolve "
+                        "88.6→23.3ms，spk_emb ~58→~7ms）。首启无 plan 缓存时 "
+                        "一次性 build ~2-3min；需要 tensorrt python 包")
     args = p.parse_args()
     if args.t2w_batch_mode == "packed" and args.stream_estimator != "flashinfer":
         raise SystemExit("--t2w-batch-mode packed 要求 --stream-estimator "
@@ -190,7 +195,8 @@ def main():
                               device=args.token2wav_device,
                               estimator_mode=args.stream_estimator,
                               batch_mode=args.t2w_batch_mode,
-                              hift_compile=args.hift_compile)
+                              hift_compile=args.hift_compile,
+                              campplus_trt=args.campplus_trt)
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s)

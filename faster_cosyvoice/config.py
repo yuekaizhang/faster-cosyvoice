@@ -44,6 +44,10 @@ class Token2WavConfig:
     # ~6e-2（inductor 融合 + pad 改变 cudnn 算法选择；质量门以 ASR CER 为准，
     # 若需要流式逐位稳定请保持关闭），默认关。
     hift_compile: bool = False
+    # opt-in campplus speaker embedding 走 TensorRT（默认 ORT-CPU）：冷 ref
+    # resolve 88.6→23.3ms（spk_emb ~58→~7ms）。首启一次性 build ~2-3min 存
+    # campplus.<gpu>.fp32.plan；embedding 数值差 ~1e-5（ASR CER 门通过）。
+    campplus_trt: bool = False
 
 
 @dataclass
