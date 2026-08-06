@@ -42,7 +42,8 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         problems = check_environment(
-            require_flashinfer=False,  # v1 流式 = torch estimator
+            # [M3] 流式 estimator 可选 flashinfer（--stream-estimator）
+            require_flashinfer=(t2w_cfg.estimator_mode == "flashinfer"),
             require_draft_mirror=(llm_cfg.draft_model is not None
                                   and llm_cfg.repetition_penalty != 1.0))
         if problems:
@@ -57,8 +58,9 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         state.frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
                                           device=t2w_cfg.device,
                                           cache_size=server_cfg.voice_cache_size)
-        state.token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,
-                                              estimator_mode="torch")
+        state.token2wav = CosyVoice3Token2Wav(
+            model_dir, device=t2w_cfg.device,
+            estimator_mode=t2w_cfg.estimator_mode)
         state.batcher = Token2WavWorker(state.token2wav)
         state.voices = {}
         await state.batcher.start()
@@ -156,6 +158,10 @@ def main():
     p.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     p.add_argument("--request-timeout-s", type=float, default=300.0,
                    help="非流式请求超时（spec §7；流式超时靠客户端）")
+    p.add_argument("--stream-estimator", default="torch",
+                   choices=["torch", "flashinfer"],
+                   help="[M3] 流式 flow estimator（默认 torch；"
+                        "flashinfer = chunk-causal mask fp16 路径）")
     args = p.parse_args()
 
     import os
@@ -165,7 +171,7 @@ def main():
                         gpu_memory_utilization=args.gpu_memory_utilization)
     t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
                               device=args.token2wav_device,
-                              estimator_mode="torch")
+                              estimator_mode=args.stream_estimator)
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s)
