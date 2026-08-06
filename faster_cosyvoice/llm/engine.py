@@ -90,11 +90,13 @@ def make_stream_sampling_params(cfg: LLMConfig, codec, text_token_len: int,
     min_tokens 到达前 vLLM 会抑制一切 stop（含 eos）。"""
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
+    max_tok = max(1, min(cfg.max_tokens, 20 * text_token_len))
+    min_tok = min(max(1, 2 * text_token_len), max_tok)
     return SamplingParams(
         temperature=cfg.temperature, top_p=cfg.top_p, top_k=cfg.top_k,
         repetition_penalty=cfg.repetition_penalty,
-        min_tokens=max(1, 2 * text_token_len),
-        max_tokens=min(cfg.max_tokens, 20 * text_token_len),
+        min_tokens=min_tok,
+        max_tokens=max_tok,
         stop_token_ids=[codec.eos_token_id],
         seed=seed, detokenize=False,
         output_kind=RequestOutputKind.DELTA)
@@ -106,4 +108,8 @@ async def stream_token_ids(engine, prompt: str, sp, request_id: str):
     async for out in engine.generate(prompt, sp, request_id):
         yield list(out.outputs[0].token_ids), out.finished
         if out.finished:
+            if out.outputs[0].finish_reason == "length":
+                logging.getLogger(__name__).warning(
+                    "request %s hit max_tokens (audio likely truncated)",
+                    request_id)
             break

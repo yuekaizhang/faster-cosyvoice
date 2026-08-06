@@ -53,3 +53,15 @@ def test_stream_sampling_params_caps_at_2048():
     sp = make_stream_sampling_params(LLMConfig(), FakeCodec(),
                                      text_token_len=1000, seed=0)
     assert sp.max_tokens == 2048
+
+
+def test_stream_sampling_params_long_text_clamped():
+    sp = make_stream_sampling_params(LLMConfig(), FakeCodec(),
+                                     text_token_len=1025, seed=0)
+    assert sp.max_tokens == 2048 and sp.min_tokens == 2048
+
+
+def test_stream_sampling_params_zero_text():
+    sp = make_stream_sampling_params(LLMConfig(), FakeCodec(),
+                                     text_token_len=0, seed=0)
+    assert sp.max_tokens == 1 and sp.min_tokens == 1
