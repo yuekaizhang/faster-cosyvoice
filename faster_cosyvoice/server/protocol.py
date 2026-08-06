@@ -60,16 +60,23 @@ class VoiceRequest(BaseModel):
 def decode_ref_audio(ref: str, max_seconds: float = 30.0):
     """→ (1-D float32 numpy, sr)。超长截断并 warning（spec §7）。"""
     if ref.startswith("data:"):
-        b64 = ref.split(",", 1)[1]
-        data = io.BytesIO(base64.b64decode(b64))
+        try:
+            b64 = ref.split(",", 1)[1]
+            data = io.BytesIO(base64.b64decode(b64, validate=True))
+        except Exception as e:
+            raise ValueError(f"ref_audio 无法解析: {e}") from e
     elif ref.startswith(("http://", "https://")):
         import httpx
         resp = httpx.get(ref, timeout=30.0, follow_redirects=True)
         resp.raise_for_status()
         data = io.BytesIO(resp.content)
     else:
+        # 信任假设：内网部署，允许本地路径/任意 URL（外网部署需加白名单/关闭此分支）
         data = ref  # 本地路径
-    wav, sr = sf.read(data, dtype="float32")
+    try:
+        wav, sr = sf.read(data, dtype="float32")
+    except Exception as e:
+        raise ValueError(f"ref_audio 无法解析: {e}") from e
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
     limit = int(max_seconds * sr)
