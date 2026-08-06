@@ -82,7 +82,10 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         flow 全前缀重算(streaming=True) → mel 按 token_offset×2 切新段 → 拼
         session.mel_cache → hift 对全量 mel 重跑 → 按 speech_offset 切新音频。
         HiFT 无跨调用状态，共享实例可多 session 交错；重算确定性由
-        CausalConditionalCFM 的固定 rand_noise 保证。返回 (1, N) cpu fp32。"""
+        CausalConditionalCFM 的固定 rand_noise 保证。返回 (1, N) cpu fp32。
+
+        注意：本方法刻意不加 autocast 包装（torch estimator 模式恒 fp32）；
+        若未来加 fp16 torch 路径，需与 _flow_single 的 autocast 处理对齐。"""
         assert self.estimator_mode == "torch", \
             "flashinfer estimator 仅支持 offline（流式 mask 是 M3）"
         cond = session.cond
@@ -103,7 +106,7 @@ class CosyVoice3Token2Wav(torch.nn.Module):
                                          device=self.device),
             embedding=embedding,
             streaming=True, finalize=plan.finalize)
-        mel = mel[:, :, plan.token_offset * 2:]
+        mel = mel[:, :, plan.token_offset * self.flow.token_mel_ratio:]
         if session.mel_cache is not None:
             mel = torch.cat([session.mel_cache, mel], dim=2)
         session.mel_cache = mel
