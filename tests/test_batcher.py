@@ -44,6 +44,15 @@ async def test_first_chunks_have_priority():
 
 
 @pytest.mark.asyncio
+async def test_submit_after_stop_raises():
+    w = Token2WavWorker(FakeT2W())
+    await w.start()
+    await w.stop()
+    with pytest.raises(RuntimeError):
+        w.submit_nowait("s", "p", chunk_index=0)
+
+
+@pytest.mark.asyncio
 async def test_error_fails_only_that_job():
     class Boom:
         def stream_step(self, session, plan):

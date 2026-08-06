@@ -5,6 +5,8 @@
 阻塞；优先队列按 (chunk_index, 到达序) —— 新请求首块插队保 TTFA 公平
 （triton priority 方案的 asyncio 版）。v2 只换消费循环为"弹出所有异 session
 ready job → flashinfer packed 一次 forward"，submit 接口不变。
+
+stop() 先排空已排队 job 再退出；stop 后 submit 会 RuntimeError。
 """
 import asyncio
 import heapq
@@ -35,9 +37,14 @@ class Token2WavWorker:
             self._wakeup.set()
         if self._task:
             await self._task
+        for entry in self._heap:   # stop 竞态期间溜进来的 job：取消勿悬挂
+            entry[-1].cancel()
+        self._heap.clear()
         self._gpu.shutdown(wait=False)
 
     def submit_nowait(self, session, plan, chunk_index: int) -> asyncio.Future:
+        if self._stopping:
+            raise RuntimeError("Token2WavWorker 已停止")
         fut = asyncio.get_running_loop().create_future()
         heapq.heappush(self._heap, (chunk_index, next(self._seq),
                                     session, plan, fut))
@@ -50,21 +57,29 @@ class Token2WavWorker:
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
-        while True:
-            while not self._heap:
-                if self._stopping:
-                    return
-                self._wakeup.clear()
-                await self._wakeup.wait()
-            _, _, session, plan, fut = heapq.heappop(self._heap)
-            if fut.cancelled():        # 断连后丢弃该 job（spec §7）
-                continue
-            try:
-                result = await loop.run_in_executor(
-                    self._gpu, self._t2w.stream_step, session, plan)
-            except Exception as e:  # noqa: BLE001 —— 只 fail 本 job，worker 存活
+        try:
+            while True:
+                while not self._heap:
+                    if self._stopping:
+                        return
+                    self._wakeup.clear()
+                    await self._wakeup.wait()
+                _, _, session, plan, fut = heapq.heappop(self._heap)
+                # 断连后丢弃该 job（spec §7）。GPU 中途取消会留下已推进的
+                # session 状态——安全：断连 session 直接丢弃，绝不复用。
+                if fut.cancelled():
+                    continue
+                try:
+                    result = await loop.run_in_executor(
+                        self._gpu, self._t2w.stream_step, session, plan)
+                except Exception as e:  # noqa: BLE001 —— 只 fail 本 job，worker 存活
+                    if not fut.cancelled():
+                        fut.set_exception(e)
+                    continue
                 if not fut.cancelled():
-                    fut.set_exception(e)
-                continue
-            if not fut.cancelled():
-                fut.set_result(result)
+                    fut.set_result(result)
+        finally:
+            # 消费者退出（含被 cancel/异常死亡）：残留 job 取消勿悬挂
+            for entry in self._heap:
+                entry[-1].cancel()
+            self._heap.clear()
