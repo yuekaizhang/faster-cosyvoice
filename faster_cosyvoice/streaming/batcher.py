@@ -53,7 +53,14 @@ class Token2WavWorker:
         return fut
 
     async def submit(self, session, plan, chunk_index: int) -> Any:
-        return await self.submit_nowait(session, plan, chunk_index)
+        fut = self.submit_nowait(session, plan, chunk_index)
+        try:
+            return await fut
+        except BaseException:
+            # 消费方弃等（断连 → GeneratorExit/CancelledError）：取消 job，
+            # 避免孤儿 GPU 任务继续推进已丢弃的 session
+            fut.cancel()
+            raise
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()

@@ -44,10 +44,14 @@ async def resolve_condition(state, req: SpeechRequest):
     return cond, req.ref_text
 
 
-async def synthesize_pcm(state, req: SpeechRequest) -> AsyncGenerator[bytes, None]:
-    """yield 原始 PCM_16 chunk（不含 WAV 头）。取消即自动 abort LLM 请求。"""
+async def synthesize_pcm(state, req: SpeechRequest,
+                         cond_pair=None) -> AsyncGenerator[bytes, None]:
+    """yield 原始 PCM_16 chunk（不含 WAV 头）。取消即自动 abort LLM 请求。
+    cond_pair=(RefCondition, ref_text)：流式路径由 handler 在响应头发出前
+    预先 resolve（坏 voice/ref 才能返回 400）；None 则内部解析。"""
     t_start = time.perf_counter()
-    cond, ref_text = await resolve_condition(state, req)
+    cond, ref_text = (cond_pair if cond_pair is not None
+                      else await resolve_condition(state, req))
     prompt = build_prompt(state.tokenizer, ref_text, req.input,
                           cond.prompt_tokens_llm)
     text_len = len(state.tokenizer.encode(req.input))
@@ -90,9 +94,10 @@ async def synthesize_pcm(state, req: SpeechRequest) -> AsyncGenerator[bytes, Non
         wall_s=round(time.perf_counter() - t_start, 2)), ensure_ascii=False))
 
 
-async def synthesize_response_chunks(state, req) -> AsyncGenerator[bytes, None]:
+async def synthesize_response_chunks(state, req,
+                                     cond_pair=None) -> AsyncGenerator[bytes, None]:
     """流式响应体：wav 先发未知长度头，再全是 PCM。"""
     if req.response_format == "wav":
         yield wav_stream_header(SAMPLE_RATE)
-    async for chunk in synthesize_pcm(state, req):
+    async for chunk in synthesize_pcm(state, req, cond_pair):
         yield chunk

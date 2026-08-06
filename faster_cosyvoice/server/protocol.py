@@ -67,8 +67,11 @@ def decode_ref_audio(ref: str, max_seconds: float = 30.0):
             raise ValueError(f"ref_audio 无法解析: {e}") from e
     elif ref.startswith(("http://", "https://")):
         import httpx
-        resp = httpx.get(ref, timeout=30.0, follow_redirects=True)
-        resp.raise_for_status()
+        try:
+            resp = httpx.get(ref, timeout=30.0, follow_redirects=True)
+            resp.raise_for_status()
+        except Exception as e:
+            raise ValueError(f"ref_audio URL 拉取失败: {e}") from e
         data = io.BytesIO(resp.content)
     else:
         # 信任假设：内网部署，允许本地路径/任意 URL（外网部署需加白名单/关闭此分支）

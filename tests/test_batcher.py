@@ -53,6 +53,29 @@ async def test_submit_after_stop_raises():
 
 
 @pytest.mark.asyncio
+async def test_submit_cancelled_on_generator_exit():
+    """消费方弃等（GeneratorExit 注入，即断连时 Starlette aclose 路径）
+    → 排队的 future 被取消。手动驱动协程注入 GeneratorExit：task.cancel()
+    会由 asyncio 自带机制取消被 await 的 future，锁不住本修复。"""
+    w = Token2WavWorker(FakeT2W())
+    fut_holder = {}
+    orig = w.submit_nowait
+
+    def spy(session, plan, chunk_index):
+        fut = orig(session, plan, chunk_index)
+        fut_holder["fut"] = fut
+        return fut
+
+    w.submit_nowait = spy
+
+    coro = w.submit("s", "p", chunk_index=0)
+    coro.send(None)                 # 推进到 await fut 挂起（worker 未启动）
+    with pytest.raises(GeneratorExit):
+        coro.throw(GeneratorExit)   # 断连注入
+    assert fut_holder["fut"].cancelled()
+
+
+@pytest.mark.asyncio
 async def test_error_fails_only_that_job():
     class Boom:
         def stream_step(self, session, plan):

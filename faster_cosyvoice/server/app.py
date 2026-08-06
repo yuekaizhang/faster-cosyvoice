@@ -22,6 +22,7 @@ from faster_cosyvoice.envcheck import check_environment
 from faster_cosyvoice.llm.engine import create_async_llm
 from faster_cosyvoice.llm.tokens import SpeechTokenCodec
 from faster_cosyvoice.server.openai_speech import (NoSpeechTokens, SAMPLE_RATE,
+                                                   resolve_condition,
                                                    synthesize_pcm,
                                                    synthesize_response_chunks)
 from faster_cosyvoice.server.protocol import (SpeechRequest, VoiceRequest,
@@ -81,7 +82,8 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         n = 0
         async for _ in synthesize_pcm(state, req):
             n += 1
-        assert n > 0, "warmup 未产出音频"
+        if n == 0:
+            raise RuntimeError("warmup 未产出音频")
         logger.info("warmup OK (%d chunks)", n)
 
     app = FastAPI(lifespan=lifespan)
@@ -92,11 +94,15 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
 
     @app.post("/v1/audio/speech")
     async def speech(req: SpeechRequest):
+        """流式路径先 resolve（坏 voice/ref → 400）；响应头发出后
+        生成中途出错只能截断流（chunked transfer 固有限制）。"""
         media = "audio/wav" if req.response_format == "wav" else "audio/pcm"
         try:
             if req.stream:
+                cond_pair = await resolve_condition(state, req)
                 return StreamingResponse(
-                    synthesize_response_chunks(state, req), media_type=media)
+                    synthesize_response_chunks(state, req, cond_pair),
+                    media_type=media)
             chunks = []
             async with asyncio.timeout(state.server_cfg.request_timeout_s):
                 async for c in synthesize_pcm(state, req):
