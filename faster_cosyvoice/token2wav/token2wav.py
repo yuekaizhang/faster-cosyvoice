@@ -75,3 +75,41 @@ class CosyVoice3Token2Wav(torch.nn.Module):
                 embedding=embedding,
                 streaming=False, finalize=True)
         return mel
+
+    @torch.inference_mode()
+    def stream_step(self, session, plan) -> torch.Tensor:
+        """v1 torch 流式路径（spec D3/§5.2；语义同 duplex forward_stream 单步）：
+        flow 全前缀重算(streaming=True) → mel 按 token_offset×2 切新段 → 拼
+        session.mel_cache → hift 对全量 mel 重跑 → 按 speech_offset 切新音频。
+        HiFT 无跨调用状态，共享实例可多 session 交错；重算确定性由
+        CausalConditionalCFM 的固定 rand_noise 保证。返回 (1, N) cpu fp32。"""
+        assert self.estimator_mode == "torch", \
+            "flashinfer estimator 仅支持 offline（流式 mask 是 M3）"
+        cond = session.cond
+        token = torch.tensor([session.tokens[:plan.prefix_len]],
+                             device=self.device)
+        prompt_token = torch.tensor([cond.prompt_tokens_flow],
+                                    device=self.device)
+        prompt_feat = cond.prompt_feat.to(self.device)
+        embedding = cond.spk_embedding.unsqueeze(0).to(self.device)
+        mel, _ = self.flow.inference(
+            token=token,
+            token_len=torch.tensor([token.shape[1]], device=self.device),
+            prompt_token=prompt_token,
+            prompt_token_len=torch.tensor([prompt_token.shape[1]],
+                                          device=self.device),
+            prompt_feat=prompt_feat,
+            prompt_feat_len=torch.tensor([prompt_feat.shape[1]],
+                                         device=self.device),
+            embedding=embedding,
+            streaming=True, finalize=plan.finalize)
+        mel = mel[:, :, plan.token_offset * 2:]
+        if session.mel_cache is not None:
+            mel = torch.cat([session.mel_cache, mel], dim=2)
+        session.mel_cache = mel
+        speech, _ = self.hift.inference(speech_feat=mel,
+                                        finalize=plan.finalize)
+        new = speech[:, session.speech_offset:]
+        session.speech_offset += new.shape[1]
+        session.chunk_index += 1
+        return new.cpu()
