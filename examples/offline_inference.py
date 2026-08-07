@@ -63,6 +63,11 @@ def get_args():
     p.add_argument("--hift-compile", action="store_true",
                    help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
                         "shape ~52ms → ~13-21ms；init 一次性 warmup ~15-20s）")
+    p.add_argument("--hift-graph-buckets", default=None,
+                   help="[M3.5-r4] 流式 hift bucketed CUDA graphs（逗号分隔 mel "
+                        "帧数，如 '64,128,192,256,384,512'）。仅流式中间 chunk"
+                        "（finalize=False）命中；offline 全 finalize=True 实际"
+                        "不受影响，本旋钮仅为配置贯通（见 server 同名参数）")
     p.add_argument("--output-dir", default="results/offline")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -116,7 +121,8 @@ def main():
                               estimator_mode=args.estimator,
                               batch_size=args.token2wav_batch_size,
                               cuda_graph_buckets=args.t2w_cuda_graph_buckets,
-                              hift_compile=args.hift_compile)
+                              hift_compile=args.hift_compile,
+                              hift_graph_buckets=args.hift_graph_buckets)
 
     problems = check_environment(
         require_flashinfer=(args.estimator == "flashinfer"),
@@ -139,10 +145,13 @@ def main():
                                 campplus_trt=args.campplus_trt)
     buckets = ([float(s) for s in t2w_cfg.cuda_graph_buckets.split(",")]
                if t2w_cfg.cuda_graph_buckets else None)
+    hift_buckets = ([int(v) for v in t2w_cfg.hift_graph_buckets.split(",")]
+                    if t2w_cfg.hift_graph_buckets else None)
     token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,
                                     estimator_mode=t2w_cfg.estimator_mode,
                                     cuda_graph_buckets=buckets,
-                                    hift_compile=t2w_cfg.hift_compile)
+                                    hift_compile=t2w_cfg.hift_compile,
+                                    hift_graph_buckets=hift_buckets)
 
     metrics = dict(llm_wall_s=0.0, t2w_wall_s=0.0, frontend_wall_s=0.0,
                    output_tokens=0, finished_by_stop=0, failed=[])

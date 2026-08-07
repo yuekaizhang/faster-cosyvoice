@@ -54,6 +54,18 @@ class Token2WavConfig:
     # ~6e-2（inductor 融合 + pad 改变 cudnn 算法选择；质量门以 ASR CER 为准，
     # 若需要流式逐位稳定请保持关闭），默认关。
     hift_compile: bool = False
+    # [M3.5-r4] 流式 hift bucketed CUDA graphs：逗号分隔 mel 帧数（如
+    # "64,128,192,256,384,512"）；None=关。finalize=False 中间 chunk 的
+    # hift.inference 整段捕成 per-bucket graph（pad-to-bucket + 按真实长度
+    # 切片，数学等价，实测 max-abs-diff ~3e-4；finalize=True 最终 chunk 走原
+    # 路径）。同卡 vLLM 抢占实测（uniform-25 + stream_graph_buckets 基线，
+    # 2 warmup + 5 runs 中位数）：chunk-1 hift 16.8→8.9ms、TTFP ~112→~105ms
+    # （加不加 hift_compile 都是 ~105）；26 条流式 ASR 转写与基线逐字相同
+    # （mean CER 0.1022）。流式中间 chunk 用它可替代 hift_compile（数学等价
+    # vs compile 的流式 ~6e-2 漂移，免 15-20s inductor warmup；final chunk /
+    # offline 仍走 hift_compile 路径若开）。per-bucket 首遇 lazy capture
+    # 数百 ms。质量门 = ASR CER。
+    hift_graph_buckets: Optional[str] = None
     # opt-in campplus speaker embedding 走 TensorRT（默认 ORT-CPU）：冷 ref
     # resolve 88.6→23.3ms（spk_emb ~58→~7ms）。首启一次性 build ~2-3min 存
     # campplus.<gpu>.fp32.plan；embedding 数值差 ~1e-5（ASR CER 门通过）。

@@ -21,6 +21,8 @@ def test_token2wav_defaults():
     assert c.hift_compile is False  # 默认关：opt-in torch.compile(hift.decode)
     # [M3.5-r2] 默认关：opt-in 流式 bucketed CUDA graphs
     assert c.stream_graph_buckets is None
+    # [M3.5-r4] 默认关：opt-in 流式 hift bucketed CUDA graphs
+    assert c.hift_graph_buckets is None
 
 
 def test_server_chunk_defaults_match_current_behavior():

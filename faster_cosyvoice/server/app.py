@@ -62,11 +62,15 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         stream_buckets = ([int(v) for v in
                            t2w_cfg.stream_graph_buckets.split(",")]
                           if t2w_cfg.stream_graph_buckets else None)
+        hift_buckets = ([int(v) for v in
+                         t2w_cfg.hift_graph_buckets.split(",")]
+                        if t2w_cfg.hift_graph_buckets else None)
         state.token2wav = CosyVoice3Token2Wav(
             model_dir, device=t2w_cfg.device,
             estimator_mode=t2w_cfg.estimator_mode,
             hift_compile=t2w_cfg.hift_compile,
-            stream_graph_buckets=stream_buckets)
+            stream_graph_buckets=stream_buckets,
+            hift_graph_buckets=hift_buckets)
         state.batcher = Token2WavWorker(state.token2wav,
                                         mode=t2w_cfg.batch_mode,
                                         max_batch=t2w_cfg.batch_size)
@@ -187,6 +191,14 @@ def main():
                         "warmup 会预热 warmup voice 命中的桶。建议配合 "
                         "--codec-chunk-frames 25 --codec-chunk-scale 1 "
                         "（chunk 形状可枚举）")
+    p.add_argument("--hift-graph-buckets", default=None,
+                   help="[M3.5-r4] 流式 hift bucketed CUDA graphs：逗号分隔 "
+                        "mel 帧数（如 \"64,128,192,256,384,512\"）。"
+                        "finalize=False 中间 chunk 整段 hift 捕成 graph"
+                        "（pad-to-bucket，数学等价 ~3e-4；最终 chunk 走原路径）。"
+                        "同卡 vLLM 抢占下 chunk-1 hift 16.8→8.9ms、TTFP "
+                        "~112→~105ms；per-bucket 首遇 lazy capture。"
+                        "质量门 = ASR CER")
     p.add_argument("--codec-chunk-frames", type=int, default=15,
                    help="[M3.5-r2] ChunkPlanner chunk_size（token 数；默认 15 "
                         "= 现行行为；uniform-25 模式设 25）")
@@ -215,7 +227,8 @@ def main():
                               batch_mode=args.t2w_batch_mode,
                               hift_compile=args.hift_compile,
                               campplus_trt=args.campplus_trt,
-                              stream_graph_buckets=args.stream_graph_buckets)
+                              stream_graph_buckets=args.stream_graph_buckets,
+                              hift_graph_buckets=args.hift_graph_buckets)
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s,

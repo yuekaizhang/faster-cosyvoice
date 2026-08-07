@@ -66,7 +66,8 @@ class CosyVoice3Token2Wav(torch.nn.Module):
                  estimator_mode: str = "flashinfer",
                  cuda_graph_buckets: Optional[list] = None,
                  hift_compile: bool = False,
-                 stream_graph_buckets: Optional[list] = None):
+                 stream_graph_buckets: Optional[list] = None,
+                 hift_graph_buckets: Optional[list] = None):
         super().__init__()
         self.device = device
         self.fp16 = False
@@ -81,8 +82,20 @@ class CosyVoice3Token2Wav(torch.nn.Module):
             weights_only=True).items()}
         self.hift.load_state_dict(hift_sd, strict=True)
         self.hift.to(device).eval()
+        # [M3.5-r4] stash 原始 eager decode（hift_graph capture 用；须在
+        # hift_compile 替换 decode 之前取）。
+        _eager_decode = self.hift.decode
         if hift_compile:
             _enable_hift_compile(self.hift, device)
+        if hift_graph_buckets:
+            # 流式 finalize=False chunk 的 bucketed CUDA graphs（opt-in，
+            # 见 hift_graph.py 模块 docstring）：lazy capture，per-bucket
+            # 首遇一次；finalize=True / 超长回退原 inference（含
+            # hift_compile 路径）。
+            from faster_cosyvoice.token2wav.hift_graph import HiftStreamGraph
+            HiftStreamGraph(self.hift, device,
+                            list(hift_graph_buckets),
+                            eager_decode=_eager_decode).install()
 
         assert estimator_mode in ("flashinfer", "torch"), estimator_mode
         self.estimator_mode = estimator_mode
