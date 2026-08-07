@@ -70,12 +70,35 @@ RTF 为 (llm+t2w)/音频时长，不含 frontend。
 |---|---|---|
 | `--stream-graph-buckets "512,640,768,896,1024,1280"` | 单 session 流式 flow 分桶 CUDA graph（mel 帧） | chunk-1 flow 89→67ms |
 | `--codec-chunk-frames 25 --codec-chunk-scale 1` | uniform-25 chunk（形状可枚举，配合上行） | — |
+| `--hift-graph-buckets "64,128,192,256,384,512"` | [M3.5-r4] 流式中间 chunk hift 整段分桶 CUDA graph（数学等价 ~3e-4） | chunk-1 hift 16.8→8.9ms，TTFP −7~8ms |
 
 两项 + `--hift-compile`：TTFP 160→149ms（无 LLM 抢占时 flow 89→23ms；流式 flow 与
 LLM 解码同卡并发，压缩空间被 SM 争抢部分吃掉）。graph 内 dense-SDPA 与 eager
 flashinfer 非逐位一致（mel corr ~0.985+；26 条流式 ASR mean CER 0.1127 vs offline
 基线 0.1078），需要逐位稳定请保持关闭。每 bucket 首遇 lazy capture ~25-100ms；
 首 chunk 长度 ≈ (prompt+pad+25)×2 帧（逐 voice 确定），建议在典型值附近配细桶。
+r4 复测（HEAD，uniform-25 + stream-graph-buckets 基线，同法）：TTFP 112.8ms；
+`+hift-compile` 111.6ms；`+hift-graph-buckets` 104.4-104.6ms（26 条流式 ASR
+转写与基线逐字相同，mean CER 0.1022）。高优先级 CUDA stream（priority=-1 包
+t2w）实测 TTFP 无变化（vLLM EngineCore 为独立进程/上下文，stream 优先级仅
+在同一 context 内生效），未收录。
+
+### CUDA MPS（同卡部署最大 TTFP 杠杆，-28ms）
+
+vLLM EngineCore 与 token2wav 是两个进程，默认时间片轮转共享 GPU——流式 chunk
+与 LLM decode 并发时互相整片抢占。启用 MPS 后两进程 kernel 合并进同一 context
+并发执行：同卡 TTFP 104.6→**76.1ms**（config C+hift-graph；不开 hift-graph 时
+77.9ms——MPS 下抢占消失，hift-graph 增益缩小到 ~2ms）。ASR 转写与非 MPS 逐字
+相同（数值不受影响）。用法（server 与 EngineCore 都会继承 env 成为 MPS client）：
+
+    export CUDA_VISIBLE_DEVICES=<gpu>          # daemon 侧选卡
+    nvidia-cuda-mps-control -d                 # 默认 pipe /tmp/nvidia-mps
+    CUDA_VISIBLE_DEVICES=0 python -m faster_cosyvoice.server.app ...  # client 内索引从 0 起
+    echo quit | nvidia-cuda-mps-control        # 结束后务必关闭 daemon
+
+注意：MPS client 的 `CUDA_VISIBLE_DEVICES` 是 daemon 可见集合内的索引（daemon
+绑单卡时 client 用 0）；自定义 `CUDA_MPS_PIPE_DIRECTORY` 路径须 <108 字符
+（UNIX socket 限制，过长 daemon 会静默退出）。
 
 ## Streaming server（M2+M3）
 
