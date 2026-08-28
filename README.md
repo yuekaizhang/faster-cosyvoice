@@ -24,8 +24,6 @@ PCM16；音色可先注册并复用，也可在单次请求中携带参考音频
 - CUDA 13 兼容的 NVIDIA driver
 - [uv](https://docs.astral.sh/uv/)
 - Python 3.12.13（由 `.python-version` 固定）
-- 一个预装 vLLM 0.25.1、PyTorch/CUDA、FlashInfer 和 CosyVoice 运行依赖的
-  base venv；默认位置是相邻目录 `../vllm025_venv`
 
 Debian/Ubuntu 容器中的系统包：
 
@@ -39,22 +37,21 @@ apt-get install -y build-essential libsndfile1 sox
 
 ## Setup with uv
 
-`pyproject.toml` 和签入的 `uv.lock` 固定项目 Python 依赖。CUDA 重依赖继续复用
-`VLLM_BASE_VENV`，因此不会在项目 venv 中重复安装整套 PyTorch/vLLM。
+`pyproject.toml` 和签入的 `uv.lock` 固定全部 Python/CUDA 依赖，包括 DSpark
+patched vLLM fork。vLLM 构建会自动复用其 base commit 对应的官方 CUDA 13
+预编译扩展，不会在本机编译 C++/CUDA。
 
 ```bash
-export VLLM_BASE_VENV=/path/to/vllm025_venv  # 默认 ../vllm025_venv
 export HF_HOME=/path/to/existing/huggingface/cache  # 可选
-
-bash scripts/setup_env.sh
-source scripts/env.sh
-source "$FCV_VENV/bin/activate"
-faster-cosyvoice-server --help
+uv sync --frozen
 ```
 
-`scripts/env.sh` 把 FlashInfer、Numba、Triton 和 TorchInductor 的运行缓存放在
-项目 `.cache/` 下，并兼容以前创建的 `venv/`。`uv sync --frozen` 是有意为之：
-lockfile 过期时直接失败，而不是静默解析一套不同环境。
+这就是完整安装，不再需要相邻的 `vllm025_venv`、手工 clone vLLM、写 `.pth`、
+设置 `PYTHONPATH` 或 activate。首次会下载 PyTorch/CUDA/vLLM 等大体积依赖，项目
+`.cache/uv/` 会持久缓存，后续容器或重新建环境会复用。`--frozen` 是有意为之：
+lockfile 过期时直接失败，而不是静默解析出不同环境。旧 checkout 可运行一次
+`bash scripts/setup_env.sh`，它会清理旧 installer 留下的两个 `.pth` 后执行同一个
+`uv sync --frozen`。
 
 ## Start the HTTP server
 
@@ -299,12 +296,10 @@ ASR/CER 质量门。Nari 方案中哪些已覆盖、哪些值得下一步实现�
 ## Tests
 
 ```bash
-source scripts/env.sh
-source "$FCV_VENV/bin/activate"
 bash scripts/check.sh
-python -m pytest tests/gpu -m gpu -v
+uv run python -m pytest tests/gpu -m gpu -v
 
-python scripts/asr_check.py \
+uv run python scripts/asr_check.py \
   --wav-dir results/... \
   --ref-json results/.../expected.json \
   --paraformer-dir models/sherpa-onnx-paraformer-zh-2023-09-14

@@ -6,7 +6,7 @@ FCV_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$FCV_ROOT"
 source scripts/env.sh
 
-"$FCV_VENV/bin/ruff" check \
+uv run --frozen ruff check \
   faster_cosyvoice/config.py \
   faster_cosyvoice/server \
   faster_cosyvoice/streaming \
@@ -18,4 +18,4 @@ source scripts/env.sh
   tests/test_protocol.py \
   tests/test_session.py \
   tests/test_stream_client.py
-"$FCV_VENV/bin/python" -m pytest --ignore=tests/gpu
+uv run --frozen python -m pytest --ignore=tests/gpu

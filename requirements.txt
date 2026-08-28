@@ -1,11 +1,15 @@
-# Compatibility list for tools that still consume requirements.txt. The uv
-# project and lockfile are authoritative; see pyproject.toml and
-# scripts/setup_env.sh. vLLM, torch, FlashInfer, s3tokenizer, librosa,
-# onnxruntime, and the remaining CUDA stack come from VLLM_BASE_VENV.
+# Compatibility list for lightweight tooling only. `uv sync` is the supported
+# install path because pyproject.toml supplies the build variables needed to
+# combine the patched vLLM fork with its pinned precompiled CUDA extensions.
 datasets==5.0.1
 httpx==0.28.1
+librosa==0.11.0
 numpy==2.3.5
+omegaconf==2.3.1
+onnxruntime==1.27.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
 sherpa-onnx==1.13.4
+s3tokenizer==0.3.0
 soundfile==0.14.0
+x-transformers==2.23.5
