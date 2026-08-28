@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faster-cosyvoice"
+version = "0.1.0"
+description = "High-performance CosyVoice3 voice-clone inference and serving"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "datasets==5.0.1",
+    "httpx==0.28.1",
+    "numpy==2.3.5",
+    "soundfile==0.14.0",
+]
+
+[project.optional-dependencies]
+quality = [
+    "ruff==0.16.0",
+    "sherpa-onnx==1.13.4",
+]
+test = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+]
+
+[project.scripts]
+faster-cosyvoice-server = "faster_cosyvoice.server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["faster_cosyvoice*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.uv]
+required-version = "==0.11.28"

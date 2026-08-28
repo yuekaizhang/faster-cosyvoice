@@ -30,6 +30,9 @@ class Token2WavConfig:
     estimator_mode: str = "flashinfer"      # flashinfer | torch
     batch_size: int = 8                     # flashinfer packed 子批上限（防 OOM）
     batch_mode: str = "packed"              # [M3] packed | serial（batcher v2；与 CLI 默认一致）
+    # Nari-style playback-deadline reserve：既有 stream 剩余 buffer 小于该值
+    # 时抢占 startup work。当前全前缀重算路径保守留 100ms；可由 CLI 调优。
+    deadline_reserve_s: float = 0.1
     # 逗号分隔秒数字符串（总时长 prompt+generated，如 "8,12,16,20,24"）；
     # None=关。仅 offline batch=1（CFG 双行 b==2）走 bucketed CUDA graph。
     cuda_graph_buckets: Optional[str] = None
@@ -86,3 +89,9 @@ class ServerConfig:
     # （+50 mel 帧/chunk，逐 voice 确定），配合 stream_graph_buckets 使用。
     codec_chunk_frames: int = 15
     codec_chunk_scale: int = 2
+    # Opt-in Nari-style silent-first suppression.  It gates only the initial
+    # PCM, retains pre-roll, and falls back without deleting audio after max_ms.
+    trim_leading_silence: bool = False
+    leading_silence_preroll_ms: float = 20.0
+    leading_silence_max_ms: float = 2000.0
+    leading_silence_min_buffer_ms: float = 400.0

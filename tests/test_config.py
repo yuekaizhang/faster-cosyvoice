@@ -17,6 +17,7 @@ def test_token2wav_defaults():
     c = Token2WavConfig()
     assert c.estimator_mode == "flashinfer"
     assert c.batch_size == 8
+    assert c.deadline_reserve_s == 0.1
     assert c.cuda_graph_buckets is None  # 默认关：opt-in bucketed CUDA graphs
     assert c.hift_compile is False  # 默认关：opt-in torch.compile(hift.decode)
     # [M3.5-r2] 默认关：opt-in 流式 bucketed CUDA graphs
@@ -30,3 +31,7 @@ def test_server_chunk_defaults_match_current_behavior():
     c = ServerConfig()
     assert c.codec_chunk_frames == 15
     assert c.codec_chunk_scale == 2
+    assert c.trim_leading_silence is False
+    assert c.leading_silence_preroll_ms == 20.0
+    assert c.leading_silence_max_ms == 2000.0
+    assert c.leading_silence_min_buffer_ms == 400.0

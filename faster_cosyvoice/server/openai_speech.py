@@ -10,10 +10,10 @@ from typing import AsyncGenerator
 
 import torch
 
-from faster_cosyvoice.llm.engine import (make_stream_sampling_params,
-                                         stream_token_ids)
+from faster_cosyvoice.llm.engine import make_stream_sampling_params, stream_token_ids
 from faster_cosyvoice.llm.prompt import build_prompt
 from faster_cosyvoice.server.audio_encode import pcm16_bytes, wav_stream_header
+from faster_cosyvoice.server.leading_silence import LeadingSilenceTrimmer
 from faster_cosyvoice.server.protocol import SpeechRequest, decode_ref_audio
 from faster_cosyvoice.streaming.chunker import ChunkPlanner
 from faster_cosyvoice.streaming.session import StreamSession
@@ -67,6 +67,12 @@ async def synthesize_pcm(state, req: SpeechRequest,
             scale=state.server_cfg.codec_chunk_scale))
     request_id = str(uuid.uuid4())
     ttfa_ms = None
+    trimmer = (LeadingSilenceTrimmer(
+        sample_rate=SAMPLE_RATE,
+        preroll_ms=state.server_cfg.leading_silence_preroll_ms,
+        max_trim_ms=state.server_cfg.leading_silence_max_ms,
+        min_buffer_ms=state.server_cfg.leading_silence_min_buffer_ms)
+        if state.server_cfg.trim_leading_silence else None)
 
     async def flush(finished: bool):
         nonlocal ttfa_ms
@@ -76,13 +82,25 @@ async def synthesize_pcm(state, req: SpeechRequest,
                 return
             pcm = await state.batcher.submit(session, plan,
                                              chunk_index=session.chunk_index)
+            payload = pcm16_bytes(pcm)
+            if trimmer is not None:
+                payload = trimmer.feed(payload, final=plan.finalize)
+            if not payload:
+                if plan.finalize:
+                    return
+                continue
             if ttfa_ms is None:
                 ttfa_ms = (time.perf_counter() - t_start) * 1000
-            yield pcm16_bytes(pcm)
+            # Publish playback credit at the route boundary, not when GPU work
+            # merely completes.  The deadline-aware token2wav scheduler then
+            # knows how much real-time audio this stream has left.
+            session.mark_pcm_routed(len(payload) // 2, SAMPLE_RATE,
+                                    time.monotonic())
+            yield payload
             if plan.finalize:
                 return
 
-    async for delta, finished in stream_token_ids(
+    async for delta, _finished in stream_token_ids(
             state.engine, prompt, sp, request_id):
         session.tokens.extend(state.codec.extract(delta))
         async for chunk in flush(finished=False):
@@ -97,6 +115,7 @@ async def synthesize_pcm(state, req: SpeechRequest,
         ttfa_ms=round(ttfa_ms or -1, 1),
         chunks=session.chunk_index, tokens=len(session.tokens),
         audio_s=round(session.speech_offset / SAMPLE_RATE, 2),
+        routed_audio_s=round(session.emitted_duration_s, 2),
         wall_s=round(time.perf_counter() - t_start, 2)), ensure_ascii=False))
 
 

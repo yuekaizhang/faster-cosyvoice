@@ -1,7 +1,13 @@
 __pycache__/
 *.pyc
+*.egg-info/
+.cache/
+.benchmark-venv/
+.venv/
 venv/
 third_party/spec-vllm/
 models/
 results/
+benchmarks/data/
+benchmarks/results/
 *.plan

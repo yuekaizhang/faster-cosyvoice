@@ -1,52 +1,141 @@
-# examples/stream_client.py
-"""流式客户端：请求 → 保存 wav + 打印 TTFA/时长。
+"""Stream raw PCM, save WAV, and report Nari-compatible audible latency.
 
-python examples/stream_client.py --url http://localhost:8000 \
-    --ref-audio ref.wav --ref-text "参考" --target-text "目标" --out out.wav
+Registered voice:
+  python examples/stream_client.py --voice demo --target-text "Hello." --out out.wav
+
+One-shot voice clone:
+  python examples/stream_client.py --ref-audio ref.wav --ref-text "Reference." \
+      --target-text "Hello." --out out.wav
 """
 import argparse
 import base64
 import json
+import math
 import time
+from pathlib import Path
 
 import httpx
+import numpy as np
 import soundfile as sf
+
+from faster_cosyvoice.server.leading_silence import audible_start_sample
+
+SAMPLE_RATE = 24_000
+FRAME_BYTES = 2
+
+
+def _audible_offset_seconds(pcm: bytes) -> float | None:
+    """Apply Nari tts-bench v1's audible-onset rule."""
+    start = audible_start_sample(pcm, SAMPLE_RATE)
+    return None if start is None else start / SAMPLE_RATE
+
+
+def _playback_metrics(observations, audible_offset):
+    """Simulate immediate playback using Nari's zero-buffer policy."""
+    if not observations:
+        return None, 0
+    deadline = observations[0][0]
+    cursor = 0.0
+    audible_at = None
+    underruns = 0
+    for index, (arrival, duration) in enumerate(observations):
+        if arrival > deadline:
+            if index > 0:
+                underruns += 1
+            deadline = arrival
+        if (audible_offset is not None and audible_at is None
+                and cursor <= audible_offset < cursor + duration):
+            audible_at = deadline + audible_offset - cursor
+        deadline += duration
+        cursor += duration
+    return audible_at, underruns
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--url", default="http://localhost:8000")
-    p.add_argument("--ref-audio", required=True)
-    p.add_argument("--ref-text", required=True)
-    p.add_argument("--target-text", required=True)
-    p.add_argument("--out", default="out.wav")
-    p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default="http://127.0.0.1:8000")
+    parser.add_argument("--voice")
+    parser.add_argument("--ref-audio")
+    parser.add_argument("--ref-text")
+    parser.add_argument("--target-text", required=True)
+    parser.add_argument("--out", default="out.wav")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-    with open(args.ref_audio, "rb") as f:
-        ref_b64 = base64.b64encode(f.read()).decode()
-    req = dict(input=args.target_text, ref_text=args.ref_text,
-               ref_audio="data:audio/wav;base64," + ref_b64,
-               stream=True, response_format="wav", seed=args.seed)
-    t0 = time.perf_counter()
-    ttfa = None
-    data = b""
-    with httpx.stream("POST", f"{args.url}/v1/audio/speech", json=req,
-                      timeout=300) as r:
-        r.raise_for_status()
-        for chunk in r.iter_bytes():
-            if ttfa is None and len(data) + len(chunk) > 44:  # 首个音频字节
-                ttfa = time.perf_counter() - t0
-            data += chunk
-    if ttfa is None:
-        ttfa = time.perf_counter() - t0
-    with open(args.out, "wb") as f:
-        f.write(data)
-    audio, sr = sf.read(args.out)
-    print(json.dumps(dict(ttfa_ms=round(ttfa * 1000, 1),
-                          audio_s=round(len(audio) / sr, 2),
-                          wall_s=round(time.perf_counter() - t0, 2)),
-                     ensure_ascii=False))
+    request = {
+        "model": "faster-cosyvoice",
+        "input": args.target_text,
+        "stream": True,
+        "response_format": "pcm",
+        "seed": args.seed,
+    }
+    if args.voice:
+        if args.ref_audio or args.ref_text:
+            parser.error("choose --voice or --ref-audio/--ref-text")
+        request["voice"] = args.voice
+    else:
+        if not args.ref_audio or not args.ref_text:
+            parser.error("provide --voice or both --ref-audio and --ref-text")
+        request["ref_audio"] = (
+            "data:audio/wav;base64,"
+            + base64.b64encode(Path(args.ref_audio).read_bytes()).decode()
+        )
+        request["ref_text"] = args.ref_text
+
+    started = time.perf_counter()
+    first_body = None
+    remainder = b""
+    pcm_parts = []
+    observations = []
+    with httpx.stream(
+        "POST", f"{args.url.rstrip('/')}/v1/audio/speech",
+        json=request, timeout=300,
+    ) as response:
+        response.raise_for_status()
+        for raw in response.iter_raw():
+            if not raw:
+                continue
+            arrival = time.perf_counter() - started
+            if first_body is None:
+                first_body = arrival
+            aligned = remainder + raw
+            complete = len(aligned) - len(aligned) % FRAME_BYTES
+            pcm_chunk, remainder = aligned[:complete], aligned[complete:]
+            if pcm_chunk:
+                pcm_parts.append(pcm_chunk)
+                observations.append(
+                    (arrival, len(pcm_chunk) / FRAME_BYTES / SAMPLE_RATE)
+                )
+    wall = time.perf_counter() - started
+    if remainder:
+        raise RuntimeError("response ended with a partial PCM sample")
+    pcm = b"".join(pcm_parts)
+    if not pcm:
+        raise RuntimeError("response contained no PCM audio")
+    sf.write(args.out, np.frombuffer(pcm, dtype="<i2"), SAMPLE_RATE,
+             subtype="PCM_16")
+
+    audible_offset = _audible_offset_seconds(pcm)
+    audible_at, underruns = _playback_metrics(observations, audible_offset)
+    result = {
+        "ttfb_ms": round(
+            (first_body if first_body is not None else wall) * 1000, 1
+        ),
+        "first_playable_ms": round(observations[0][0] * 1000, 1),
+        "audible_ttfa_ms": (
+            round(audible_at * 1000, 1) if audible_at is not None else None
+        ),
+        "leading_silence_ms": (
+            round(audible_offset * 1000, 1) if audible_offset is not None else None
+        ),
+        "underruns": underruns,
+        "audio_s": round(len(pcm) / FRAME_BYTES / SAMPLE_RATE, 2),
+        "wall_s": round(wall, 2),
+    }
+    if any(isinstance(value, float) and not math.isfinite(value)
+           for value in result.values()):
+        raise RuntimeError("non-finite timing result")
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 # tests/test_batcher.py
 import asyncio
+from dataclasses import dataclass
 
 import pytest
 
@@ -13,6 +14,16 @@ class FakeT2W:
     def stream_step(self, session, plan):
         self.calls.append((session, plan))
         return f"pcm-{session}-{plan}"
+
+
+@dataclass
+class FakeStream:
+    name: str
+    playback_started_at_s: float | None = None
+    emitted_duration_s: float = 0.0
+
+    def __str__(self):
+        return self.name
 
 
 @pytest.mark.asyncio
@@ -44,12 +55,84 @@ async def test_first_chunks_have_priority():
 
 
 @pytest.mark.asyncio
+async def test_urgent_established_stream_preempts_startup():
+    """Playback credit 即将耗尽时，既有 stream 必须先于新请求首块。"""
+    t2w = FakeT2W()
+    w = Token2WavWorker(t2w, deadline_reserve_s=0.1,
+                        clock=lambda: 10.0)
+    established = FakeStream("established", playback_started_at_s=9.0,
+                             emitted_duration_s=1.05)  # deadline=10.05
+    startup = FakeStream("startup")
+    f_startup = w.submit_nowait(startup, "first", chunk_index=0)
+    f_established = w.submit_nowait(established, "next", chunk_index=1)
+    await w.start()
+    try:
+        await asyncio.gather(f_startup, f_established)
+        assert t2w.calls[0][0] is established
+    finally:
+        await w.stop()
+
+
+@pytest.mark.asyncio
+async def test_startup_preempts_nonurgent_established_stream():
+    """既有 stream buffer 充足时，仍优先降低新请求 TTFA。"""
+    t2w = FakeT2W()
+    w = Token2WavWorker(t2w, deadline_reserve_s=0.1,
+                        clock=lambda: 10.0)
+    established = FakeStream("established", playback_started_at_s=9.0,
+                             emitted_duration_s=2.0)  # deadline=11.0
+    startup = FakeStream("startup")
+    f_established = w.submit_nowait(established, "next", chunk_index=1)
+    f_startup = w.submit_nowait(startup, "first", chunk_index=0)
+    await w.start()
+    try:
+        await asyncio.gather(f_startup, f_established)
+        assert t2w.calls[0][0] is startup
+    finally:
+        await w.stop()
+
+
+@pytest.mark.asyncio
+async def test_established_streams_use_earliest_playback_deadline():
+    t2w = FakeT2W()
+    w = Token2WavWorker(t2w, deadline_reserve_s=0.1,
+                        clock=lambda: 10.0)
+    later = FakeStream("later", playback_started_at_s=9.0,
+                       emitted_duration_s=3.0)
+    earlier = FakeStream("earlier", playback_started_at_s=9.0,
+                         emitted_duration_s=2.0)
+    f_later = w.submit_nowait(later, "next", chunk_index=1)
+    f_earlier = w.submit_nowait(earlier, "next", chunk_index=1)
+    await w.start()
+    try:
+        await asyncio.gather(f_later, f_earlier)
+        assert t2w.calls[0][0] is earlier
+    finally:
+        await w.stop()
+
+
+def test_deadline_reserve_must_be_nonnegative():
+    with pytest.raises(ValueError):
+        Token2WavWorker(FakeT2W(), deadline_reserve_s=-0.1)
+
+
+@pytest.mark.asyncio
 async def test_submit_after_stop_raises():
     w = Token2WavWorker(FakeT2W())
     await w.start()
     await w.stop()
     with pytest.raises(RuntimeError):
         w.submit_nowait("s", "p", chunk_index=0)
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_lose_wakeup_after_draining_queue():
+    """stop racing with the transition to idle must not hang."""
+    w = Token2WavWorker(FakeT2W())
+    future = w.submit_nowait("s", "p", chunk_index=0)
+    await w.start()
+    assert await future == "pcm-s-p"
+    await asyncio.wait_for(w.stop(), timeout=1)
 
 
 @pytest.mark.asyncio
@@ -103,7 +186,7 @@ class FakeBatchT2W:
 
     def stream_step_batched(self, sessions, plans):
         self.batch_calls.append((list(sessions), list(plans)))
-        return [f"pcm-{s}-{p}" for s, p in zip(sessions, plans)]
+        return [f"pcm-{s}-{p}" for s, p in zip(sessions, plans, strict=True)]
 
 
 @pytest.mark.asyncio
@@ -184,5 +267,29 @@ async def test_packed_batch_error_fails_whole_batch_worker_alive():
         assert isinstance(r1, RuntimeError) and isinstance(r2, RuntimeError)
         # worker 存活：后续 submit 正常
         assert await w.submit("s3", "p3", chunk_index=0) == "pcm-s3-p3"
+    finally:
+        await w.stop()
+
+
+@pytest.mark.asyncio
+async def test_packed_result_count_mismatch_fails_batch_worker_alive():
+    class ShortBatch(FakeBatchT2W):
+        def __init__(self):
+            super().__init__()
+            self.short_next = True
+
+        def stream_step_batched(self, sessions, plans):
+            if self.short_next:
+                self.short_next = False
+                return []
+            return super().stream_step_batched(sessions, plans)
+
+    w = Token2WavWorker(ShortBatch(), mode="packed", max_batch=8)
+    first = w.submit_nowait("s1", "p1", chunk_index=0)
+    await w.start()
+    try:
+        with pytest.raises(RuntimeError, match="返回数量不匹配"):
+            await first
+        assert await w.submit("s2", "p2", chunk_index=0) == "pcm-s2-p2"
     finally:
         await w.stop()

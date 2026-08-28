@@ -1,12 +1,11 @@
-# 运行环境为分层复用（见 scripts/setup_env.sh），不通过本文件安装 vllm：
-#   - vllm==0.25.1 wheel（dspark 投机解码内置）+ 全部重依赖来自 vllm025_venv（.pth 挂载）
-#   - yuekaizhang/vllm@dspark-draft-sampling-mirrors 源码盖 PYTHONPATH（rep-penalty mirror，PR #48932）
-#   - flashinfer==0.6.13 / s3tokenizer / x-transformers / librosa / einops / onnxruntime / omegaconf 均已在 venv 内
-# 本文件只列额外安装进本仓 venv 的包：
-datasets
-soundfile
-pytest
-pytest-asyncio  # 异步测试（streaming batcher/server）
-numpy==2.3.5   # 必须与 vllm025_venv 层的 numba/librosa 匹配；uv 默认会拉 2.5 导致 Numba ImportError
-sherpa-onnx    # ASR 质量门
-httpx  # ref_audio URL 拉取 + 测试客户端
+# Compatibility list for tools that still consume requirements.txt. The uv
+# project and lockfile are authoritative; see pyproject.toml and
+# scripts/setup_env.sh. vLLM, torch, FlashInfer, s3tokenizer, librosa,
+# onnxruntime, and the remaining CUDA stack come from VLLM_BASE_VENV.
+datasets==5.0.1
+httpx==0.28.1
+numpy==2.3.5
+pytest==9.1.1
+pytest-asyncio==1.4.0
+sherpa-onnx==1.13.4
+soundfile==0.14.0

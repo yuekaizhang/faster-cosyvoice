@@ -21,12 +21,14 @@ from faster_cosyvoice.config import LLMConfig, ServerConfig, Token2WavConfig
 from faster_cosyvoice.envcheck import check_environment
 from faster_cosyvoice.llm.engine import create_async_llm
 from faster_cosyvoice.llm.tokens import SpeechTokenCodec
-from faster_cosyvoice.server.openai_speech import (NoSpeechTokens, SAMPLE_RATE,
-                                                   resolve_condition,
-                                                   synthesize_pcm,
-                                                   synthesize_response_chunks)
-from faster_cosyvoice.server.protocol import (SpeechRequest, VoiceRequest,
-                                              decode_ref_audio)
+from faster_cosyvoice.server.openai_speech import (
+    SAMPLE_RATE,
+    NoSpeechTokens,
+    resolve_condition,
+    synthesize_pcm,
+    synthesize_response_chunks,
+)
+from faster_cosyvoice.server.protocol import SpeechRequest, VoiceRequest, decode_ref_audio
 from faster_cosyvoice.streaming.batcher import Token2WavWorker
 from faster_cosyvoice.token2wav.frontend import RefAudioFrontend
 from faster_cosyvoice.token2wav.token2wav import CosyVoice3Token2Wav
@@ -41,6 +43,7 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
+        state.ready = False
         problems = check_environment(
             # [M3] 流式 estimator 可选 flashinfer（--stream-estimator）
             require_flashinfer=(t2w_cfg.estimator_mode == "flashinfer"),
@@ -73,12 +76,16 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
             hift_graph_buckets=hift_buckets)
         state.batcher = Token2WavWorker(state.token2wav,
                                         mode=t2w_cfg.batch_mode,
-                                        max_batch=t2w_cfg.batch_size)
+                                        max_batch=t2w_cfg.batch_size,
+                                        deadline_reserve_s=(
+                                            t2w_cfg.deadline_reserve_s))
         state.voices = {}
         await state.batcher.start()
         await _warmup()
+        state.ready = True
         logger.info("server ready")
         yield
+        state.ready = False
         await state.batcher.stop()
         state.engine.shutdown()
 
@@ -106,6 +113,23 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
     async def health():
         return {"status": "ok"}
 
+    @app.get("/ready")
+    async def ready():
+        if not getattr(state, "ready", False):
+            raise HTTPException(503, "model is not ready")
+        return {"status": "ready"}
+
+    @app.get("/v1/models")
+    async def models():
+        return {
+            "object": "list",
+            "data": [{
+                "id": llm_cfg.target_model,
+                "object": "model",
+                "owned_by": "faster-cosyvoice",
+            }],
+        }
+
     @app.post("/v1/audio/speech")
     async def speech(req: SpeechRequest):
         """流式路径先 resolve（坏 voice/ref → 400）；响应头发出后
@@ -130,11 +154,11 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
                      format="WAV")
             return Response(content=buf.getvalue(), media_type=media)
         except (KeyError, ValueError) as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         except NoSpeechTokens as e:
-            raise HTTPException(500, str(e))
-        except TimeoutError:
-            raise HTTPException(504, "请求超时")
+            raise HTTPException(500, str(e)) from e
+        except TimeoutError as e:
+            raise HTTPException(504, "请求超时") from e
 
     @app.post("/v1/audio/voices")
     async def register_voice(req: VoiceRequest):
@@ -147,7 +171,7 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
             cond = await asyncio.get_running_loop().run_in_executor(None,
                                                                     _work)
         except ValueError as e:
-            raise HTTPException(400, str(e))
+            raise HTTPException(400, str(e)) from e
         state.voices[req.name] = (cond, req.ref_text)
         return {"success": True, "voice": req.name}
 
@@ -178,6 +202,11 @@ def main():
                    choices=["serial", "packed"],
                    help="[M3] token2wav 批量模式（默认 packed = 跨 session "
                         "flashinfer 批量；要求 --stream-estimator flashinfer）")
+    p.add_argument("--t2w-batch-size", type=int, default=8,
+                   help="packed token2wav 最大 batch（默认 8）")
+    p.add_argument("--t2w-deadline-reserve-ms", type=float, default=100.0,
+                   help="既有音频流在 playback deadline 前多少毫秒抢占首块工作"
+                        "（默认 100，Nari-style deadline-aware scheduling）")
     p.add_argument("--hift-compile", action="store_true",
                    help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
                         "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）。"
@@ -205,6 +234,16 @@ def main():
     p.add_argument("--codec-chunk-scale", type=int, default=2,
                    help="[M3.5-r2] hop 逐块放大倍率（默认 2 = 现行 ×2 growth；"
                         "1 = uniform hop，chunk 形状可枚举）")
+    p.add_argument("--trim-leading-silence", action="store_true",
+                   help="按 Nari audible-onset 规则抑制首段静音，保留 pre-roll；"
+                        "仅影响开头 PCM，默认关闭")
+    p.add_argument("--leading-silence-preroll-ms", type=float, default=20.0,
+                   help="首段静音裁剪后保留的 pre-roll（默认 20ms）")
+    p.add_argument("--leading-silence-max-ms", type=float, default=2000.0,
+                   help="最多等待/裁剪的首段静音窗口（默认 2000ms）")
+    p.add_argument("--leading-silence-min-buffer-ms", type=float, default=400.0,
+                   help="裁剪后首次发送至少累计的可播放音频（默认 400ms，"
+                        "用于避免首包过短后立即 underrun）")
     p.add_argument("--campplus-trt", action="store_true",
                    help="campplus 说话人 embedding 走 TensorRT（冷 ref resolve "
                         "88.6→23.3ms，spk_emb ~58→~7ms）。首启无 plan 缓存时 "
@@ -215,6 +254,16 @@ def main():
                          "flashinfer（torch estimator 无 packed 批量路径）；"
                          "--stream-estimator torch 需同时指定 "
                          "--t2w-batch-mode serial")
+    if args.t2w_batch_size < 1:
+        raise SystemExit("--t2w-batch-size 必须 >= 1")
+    if args.t2w_deadline_reserve_ms < 0:
+        raise SystemExit("--t2w-deadline-reserve-ms 必须 >= 0")
+    if (args.leading_silence_preroll_ms < 0
+            or args.leading_silence_max_ms < 0
+            or args.leading_silence_min_buffer_ms < 0
+            or args.leading_silence_preroll_ms > args.leading_silence_max_ms):
+        raise SystemExit("需满足 0 <= leading-silence-preroll-ms "
+                         "<= leading-silence-max-ms")
 
     import os
     os.environ.setdefault("OMP_NUM_THREADS", "1")  # 同 offline 的 fork segfault 规避
@@ -225,6 +274,9 @@ def main():
                               device=args.token2wav_device,
                               estimator_mode=args.stream_estimator,
                               batch_mode=args.t2w_batch_mode,
+                              batch_size=args.t2w_batch_size,
+                              deadline_reserve_s=(
+                                  args.t2w_deadline_reserve_ms / 1000),
                               hift_compile=args.hift_compile,
                               campplus_trt=args.campplus_trt,
                               stream_graph_buckets=args.stream_graph_buckets,
@@ -233,7 +285,14 @@ def main():
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s,
                               codec_chunk_frames=args.codec_chunk_frames,
-                              codec_chunk_scale=args.codec_chunk_scale)
+                              codec_chunk_scale=args.codec_chunk_scale,
+                              trim_leading_silence=args.trim_leading_silence,
+                              leading_silence_preroll_ms=(
+                                  args.leading_silence_preroll_ms),
+                              leading_silence_max_ms=(
+                                  args.leading_silence_max_ms),
+                              leading_silence_min_buffer_ms=(
+                                  args.leading_silence_min_buffer_ms))
     uvicorn.run(build_app(llm_cfg, t2w_cfg, server_cfg),
                 host=args.host, port=args.port, log_level="info")
 

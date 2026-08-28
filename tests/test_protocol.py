@@ -2,13 +2,12 @@
 import base64
 import io
 
+import numpy as np
 import pytest
 import soundfile as sf
-import numpy as np
 
 from faster_cosyvoice.config import ServerConfig
-from faster_cosyvoice.server.protocol import (SpeechRequest, VoiceRequest,
-                                              decode_ref_audio)
+from faster_cosyvoice.server.protocol import SpeechRequest, VoiceRequest, decode_ref_audio
 
 
 def _wav_data_url(seconds=1.0, sr=16000):
@@ -33,6 +32,20 @@ def test_speech_request_validation():
     with pytest.raises(ValueError):
         SpeechRequest(input="你好", response_format="mp3",     # 非 wav/pcm
                       ref_audio="x", ref_text="y")
+
+
+def test_speech_request_accepts_nari_benchmark_fields():
+    request = SpeechRequest(
+        model="yuekai/Fun-CosyVoice3-0.5B-2512-LLM-HF",
+        input="Hello from the benchmark.",
+        voice="benchmark",
+        language="English",
+        stream=True,
+        non_streaming_mode=False,
+        response_format="pcm",
+    )
+    assert request.language == "English"
+    assert request.non_streaming_mode is False
 
 
 def test_decode_data_url_and_truncate():

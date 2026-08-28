@@ -1,135 +1,314 @@
-# faster-cosyvoice
+# Faster CosyVoice
 
-CosyVoice3 加速 voice-clone 推理：vLLM + DSpark 投机解码（LLM）+ FlashInfer DiT（token2wav）。
-设计文档：docs/superpowers/specs/2026-08-05-faster-cosyvoice-design.md
+## TL;DR
 
-## 环境（容器内）
-    bash scripts/setup_env.sh
-    source venv/bin/activate
-    export PYTHONPATH=$PWD/third_party/spec-vllm:$PYTHONPATH
-    export HF_HOME=...   # 可选，指向已有缓存
+Faster CosyVoice 是面向 NVIDIA H100 的 CosyVoice3 zero-shot voice-clone
+推理与服务实现：LLM 使用 vLLM + DSpark speculative decoding，token-to-wave
+使用 FlashInfer、跨请求 packed batching 和可选 CUDA Graph。
 
-环境为分层复用：vllm==0.25.1 wheel（dspark 内置）等重依赖来自 vllm025_venv（.pth 挂载），
-详见 requirements.txt 注释与 scripts/setup_env.sh。
+它同时提供离线批量推理和 OpenAI 风格的流式 HTTP API。服务端输出 24 kHz mono
+PCM16；音色可先注册并复用，也可在单次请求中携带参考音频。
 
-## Offline 推理
-    # 单条
-    python examples/offline_inference.py --ref-audio ref.wav \
-        --ref-text "参考文本" --target-text "目标文本" --output-dir results/single
-    # 数据集批量（wenetspeech4tts 是 split）
-    python examples/offline_inference.py --dataset yuekai/seed_tts_cosy2 \
-        --split wenetspeech4tts --batch-size 8 --output-dir results/ws4tts
-    # 关投机解码 / torch estimator 降级
-    --draft-model none / --estimator torch
+> [!NOTE]
+> **性能口径**
+>
+> 仓库原有的 TTFP 是首个 PCM chunk 延迟。新增的 benchmark 直接复用
+> [Nari Labs tts-bench](https://github.com/nari-labs/benchmarks)，以 Poisson
+> open-loop 负载测量客户端 TTFB、first playable、**audible TTFA**、leading
+> silence 和播放 underrun。两种指标不能混为一谈。完整对照见
+> [Nari 加速方案评估](docs/nari-acceleration-review.md)。
 
-脚本内部 `OMP_NUM_THREADS=1`（vLLM EngineCore fork 后 OpenMP 会 segfault），可用环境变量覆盖。
+## Requirements
 
-## 测试
-    pytest                     # CPU 单测（gpu/integration 默认跳过）
-    pytest tests/gpu -m gpu -v # offline e2e + server e2e + interleave 回归（容器内）
-    python scripts/asr_check.py --wav-dir results/... --ref-json results/.../expected.json \
-        --paraformer-dir models/sherpa-onnx-paraformer-zh-2023-09-14
+- Linux x86_64 容器；当前验证硬件为 NVIDIA H100 80GB
+- CUDA 13 兼容的 NVIDIA driver
+- [uv](https://docs.astral.sh/uv/)
+- Python 3.12.13（由 `.python-version` 固定）
+- 一个预装 vLLM 0.25.1、PyTorch/CUDA、FlashInfer 和 CosyVoice 运行依赖的
+  base venv；默认位置是相邻目录 `../vllm025_venv`
 
-## 基准（H100，yuekai/seed_tts_zh_cosy3 test_zh 200 条，bs16）
+Debian/Ubuntu 容器中的系统包：
 
-复现命令：
+```bash
+apt-get update
+apt-get install -y build-essential libsndfile1 sox
+```
 
-    python examples/offline_inference.py --dataset yuekai/seed_tts_zh_cosy3 \
-        --split test_zh --limit 200 --batch-size 16 --output-dir results/bench_dspark
-    python examples/offline_inference.py --dataset yuekai/seed_tts_zh_cosy3 \
-        --split test_zh --limit 200 --batch-size 16 --draft-model none \
-        --output-dir results/bench_baseline
+模型首次启动可能从 Hugging Face 下载 LLM、draft model 和缺失的 Codec 资产。
+已有缓存时设置 `HF_HOME`，可以避免重复下载。
 
-| 配置 | llm tok/s | 平均接受长度 | 端到端 RTF |
-|---|---|---|---|
-| dspark | 9387.6 | 2.992 | 0.0110 |
-| baseline（无 draft） | 2057.5 | — | 0.0203 |
+## Setup with uv
 
-llm 加速比 4.56x。注意：SpeechSpec 参考值为 bs16 下 1.70x（全量 2020 条）。本仓数字更高的可能原因：
-仅 200 条（continuous batching 尾部效应不同）、0.5B 模型 bs16 下 per-step 开销占主导使步数减少收益
-放大、计时口径差异（本仓只计 llm.generate 墙钟）。接受长度 2.992 与参考值 2.98 一致，说明投机
-解码行为本身对齐。
-RTF 为 (llm+t2w)/音频时长，不含 frontend。
+`pyproject.toml` 和签入的 `uv.lock` 固定项目 Python 依赖。CUDA 重依赖继续复用
+`VLLM_BASE_VENV`，因此不会在项目 venv 中重复安装整套 PyTorch/vLLM。
 
-### 性能旋钮（opt-in，默认全关；26 条 batch=1 实测，H100）
+```bash
+export VLLM_BASE_VENV=/path/to/vllm025_venv  # 默认 ../vllm025_venv
+export HF_HOME=/path/to/existing/huggingface/cache  # 可选
 
-| 旋钮 | 作用 | 收益 |
-|---|---|---|
-| `--t2w-cuda-graph-buckets "8,12,16,20,24"` | batch=1 offline flow 分桶 CUDA graph | flow 54→44ms |
-| `--campplus-trt` | campplus 走 TensorRT（plan 磁盘缓存，首次构建 ~90s） | campplus 58→7ms |
-| `--hift-compile` | hift torch.compile + 64 帧长度桶（init warmup ~15-20s） | hift 48→13ms |
+bash scripts/setup_env.sh
+source scripts/env.sh
+source "$FCV_VENV/bin/activate"
+faster-cosyvoice-server --help
+```
 
-三项全开：batch=1 每请求 e2e 301→219ms（26 条总墙钟 ~7s，RTF ~0.032）；ASR 门均通过。
-注意：`--hift-compile` 下波形与 eager 非逐位一致（offline ~8e-4，流式 worst-chunk ~6e-2），
-需要逐位稳定时保持关闭；batch≥8 时 flow 走 packed 批量，graph 桶自动不生效。
+`scripts/env.sh` 把 FlashInfer、Numba、Triton 和 TorchInductor 的运行缓存放在
+项目 `.cache/` 下，并兼容以前创建的 `venv/`。`uv sync --frozen` 是有意为之：
+lockfile 过期时直接失败，而不是静默解析一套不同环境。
 
-流式 TTFP 旋钮（server，opt-in，默认关；单并发 H100 实测，同一 cached voice
-2 warmup + 5 runs 中位数）：
+## Start the HTTP server
 
-| 旋钮 | 作用 | 收益 |
-|---|---|---|
-| `--stream-graph-buckets "512,640,768,896,1024,1280"` | 单 session 流式 flow 分桶 CUDA graph（mel 帧） | chunk-1 flow 89→67ms |
-| `--codec-chunk-frames 25 --codec-chunk-scale 1` | uniform-25 chunk（形状可枚举，配合上行） | — |
-| `--hift-graph-buckets "64,128,192,256,384,512"` | [M3.5-r4] 流式中间 chunk hift 整段分桶 CUDA graph（数学等价 ~3e-4） | chunk-1 hift 16.8→8.9ms，TTFP −7~8ms |
+默认 profile 使用 DSpark、FlashInfer 和跨 session packed batching：
 
-两项 + `--hift-compile`：TTFP 160→149ms（无 LLM 抢占时 flow 89→23ms；流式 flow 与
-LLM 解码同卡并发，压缩空间被 SM 争抢部分吃掉）。graph 内 dense-SDPA 与 eager
-flashinfer 非逐位一致（mel corr ~0.985+；26 条流式 ASR mean CER 0.1127 vs offline
-基线 0.1078），需要逐位稳定请保持关闭。每 bucket 首遇 lazy capture ~25-100ms；
-首 chunk 长度 ≈ (prompt+pad+25)×2 帧（逐 voice 确定），建议在典型值附近配细桶。
-r4 复测（HEAD，uniform-25 + stream-graph-buckets 基线，同法）：TTFP 112.8ms；
-`+hift-compile` 111.6ms；`+hift-graph-buckets` 104.4-104.6ms（26 条流式 ASR
-转写与基线逐字相同，mean CER 0.1022）。高优先级 CUDA stream（priority=-1 包
-t2w）实测 TTFP 无变化（vLLM EngineCore 为独立进程/上下文，stream 优先级仅
-在同一 context 内生效），未收录。
+```bash
+bash scripts/run_server.sh --host 127.0.0.1 --port 8000
+```
 
-### CUDA MPS（同卡部署最大 TTFP 杠杆，-28ms）
+低首音频延迟的 H100 配置：
 
-vLLM EngineCore 与 token2wav 是两个进程，默认时间片轮转共享 GPU——流式 chunk
-与 LLM decode 并发时互相整片抢占。启用 MPS 后两进程 kernel 合并进同一 context
-并发执行：同卡 TTFP 104.6→**76.1ms**（config C+hift-graph；不开 hift-graph 时
-77.9ms——MPS 下抢占消失，hift-graph 增益缩小到 ~2ms）。ASR 转写与非 MPS 逐字
-相同（数值不受影响）。用法（server 与 EngineCore 都会继承 env 成为 MPS client）：
+```bash
+bash scripts/run_server.sh \
+  --host 127.0.0.1 --port 8000 \
+  --campplus-trt \
+  --codec-chunk-frames 25 --codec-chunk-scale 1 \
+  --stream-graph-buckets 512,640,768,896,1024,1280 \
+  --hift-graph-buckets 64,128,192,256,384,512 \
+  --trim-leading-silence
+```
 
-    export CUDA_VISIBLE_DEVICES=<gpu>          # daemon 侧选卡
-    nvidia-cuda-mps-control -d                 # 默认 pipe /tmp/nvidia-mps
-    CUDA_VISIBLE_DEVICES=0 python -m faster_cosyvoice.server.app ...  # client 内索引从 0 起
-    echo quit | nvidia-cuda-mps-control        # 结束后务必关闭 daemon
+token-to-wave 默认使用 Nari-style deadline-aware scheduling：新请求首块优先，
+但已经开始播放且即将耗尽 buffer 的 stream 会按最早 deadline 抢占，避免持续流被
+首块洪峰饿死。`--trim-leading-silence` 是可选的 audible-TTFA 优化：它按 benchmark
+同一检测规则裁掉首段静音，保留 20 ms pre-roll，并在首次发送前累计至少 400 ms
+可播放音频以避免紧接着 underrun。需要保留原始开头 PCM 时不要打开该参数。
 
-注意：MPS client 的 `CUDA_VISIBLE_DEVICES` 是 daemon 可见集合内的索引（daemon
-绑单卡时 client 用 0）；自定义 `CUDA_MPS_PIPE_DIRECTORY` 路径须 <108 字符
-（UNIX socket 限制，过长 daemon 会静默退出）。
+模型加载、CUDA Graph capture 和一条全链路 warmup 完成前，`/ready` 返回 503：
 
-## Streaming server（M2+M3）
+```bash
+curl --fail http://127.0.0.1:8000/ready
+curl http://127.0.0.1:8000/v1/models
+```
 
-    bash scripts/run_server.sh --port 8000          # 启动（含引擎加载+warmup，~2分钟）
-    # 流式请求（客户端示例，打印 TTFA/时长）：
-    python examples/stream_client.py --url http://localhost:8000 \
-        --ref-audio ref.wav --ref-text "参考文本" --target-text "目标文本" --out out.wav
-    # curl（非流式）：
-    curl -X POST http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' \
-        -d '{"input":"你好","voice":"my_voice"}' -o out.wav
-    # 音色注册 / 列表：
-    curl -X POST http://localhost:8000/v1/audio/voices -H 'Content-Type: application/json' \
-        -d '{"name":"my_voice","ref_audio":"data:audio/wav;base64,...","ref_text":"参考文本"}'
-    curl http://localhost:8000/v1/audio/voices
+### CUDA MPS
 
-协议：OpenAI `/v1/audio/speech`（扩展 `ref_audio`/`ref_text`/`seed`），`response_format` wav|pcm，
-`stream:true` 为增量 PCM（首包 44 字节未知长度 WAV 头）。流式 token2wav 默认走 flashinfer
-estimator（chunk-causal custom mask，fp16）+ 跨 session packed 批量（`--t2w-batch-mode packed`，
-batcher v2）；回退开关：`--stream-estimator torch --t2w-batch-mode serial`（M2 torch 路径，
-两者需同时指定）。LLM 侧 DSpark 投机解码照常生效。
-音色注册为内存态，重启即失。`--draft-model none` 关投机解码；`--gpu-memory-utilization` 默认 0.5。
+vLLM EngineCore 和 token-to-wave worker 是独立 CUDA 进程。在同一张 H100 上启用
+MPS 可以避免粗粒度时间片抢占。仓库此前的单请求内部首 PCM chunk 中位数为
+`104.6 ms -> 76.1 ms`；这不是 Nari audible TTFA。
 
-实测（H100，e2e 测试 4 并发流式，同一提交顺序跑两轮）：
+```bash
+export CUDA_VISIBLE_DEVICES=0
+nvidia-cuda-mps-control -d
+bash scripts/run_server.sh \
+  --codec-chunk-frames 25 --codec-chunk-scale 1 \
+  --stream-graph-buckets 512,640,768,896,1024,1280 \
+  --hift-graph-buckets 64,128,192,256,384,512
 
-| 配置 | server TTFA (ms) | client TTFA (ms) | 每请求 wall (s) |
-|---|---|---|---|
-| torch + serial（M2，回退） | 483 / 674 / 865 / 1059 | 923–1499 | 2.2–3.1 |
-| flashinfer + packed（M3，默认） | 350 / 468 / 463 / 466 | 640–753 | 0.8–1.1 |
+# 服务退出后关闭 daemon
+echo quit | nvidia-cuda-mps-control
+```
 
-ASR 门（CER≤0.15）流式/非流式 5/5 通过（flashinfer+packed per-item CER 0.06–0.11），
-同 seed 流式与非流式转写一致。交错回归测试锁定多 session 确定性
-（tests/gpu/test_interleave.py、test_stream_flashinfer.py、test_stream_batched.py）。
+daemon 只看到一张卡时，client 的 `CUDA_VISIBLE_DEVICES=0` 指的是该可见集合内的
+第 0 张卡。自定义 `CUDA_MPS_PIPE_DIRECTORY` 时路径需短于 UNIX socket 限制。
 
-M1 offline + M2 streaming server + M3（flashinfer 流式 mask + 跨请求 packed batch）全部落地。
+## Register a reusable voice
+
+音色存于当前 server 进程内存，重启后需要重新注册。推荐把注册放到部署启动流程，
+这样每个 TTS 请求不再重复运行参考音频解码和 CampPlus。
+
+```bash
+python examples/register_voice.py \
+  --url http://127.0.0.1:8000 \
+  --name demo \
+  --ref-audio ref.wav \
+  --ref-text "Transcript of the reference audio."
+
+curl http://127.0.0.1:8000/v1/audio/voices
+```
+
+也可直接从缓存的数据集取一行作为固定 benchmark voice：
+
+```bash
+python examples/register_voice.py \
+  --name benchmark \
+  --dataset yuekai/seed_tts_cosy2 \
+  --split test_en --index 0
+```
+
+## API
+
+服务提供：
+
+- `GET /health`
+- `GET /ready`
+- `GET /v1/models`
+- `GET /v1/audio/voices`
+- `POST /v1/audio/voices`
+- `POST /v1/audio/speech`
+
+### Non-streaming request
+
+`POST /v1/audio/speech` 使用 OpenAI Audio Speech 请求形状，并扩展支持
+`ref_audio`、`ref_text`、`language` 和 `seed`。
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "yuekai/Fun-CosyVoice3-0.5B-2512-LLM-HF",
+    "input": "Hello from Faster CosyVoice.",
+    "voice": "demo",
+    "language": "English",
+    "response_format": "wav",
+    "stream": false
+  }' \
+  --output speech.wav
+```
+
+### Streaming request and audible timing
+
+```bash
+python examples/stream_client.py \
+  --url http://127.0.0.1:8000 \
+  --voice demo \
+  --target-text "Streaming speech should start quickly." \
+  --out speech.wav
+```
+
+客户端请求原始 PCM 流并打印 Nari-compatible 的 `ttfb_ms`、
+`first_playable_ms`、`audible_ttfa_ms`、`leading_silence_ms` 和 `underruns`。
+也可以用 `--ref-audio` 与 `--ref-text` 做单次 zero-shot clone。
+
+`response_format=pcm` 返回 raw little-endian PCM16；`response_format=wav` 在流式
+响应开头返回 unknown-length WAV header。采样率固定为 24 kHz mono。
+
+## Nari-compatible benchmark
+
+安装相邻 `../nari/benchmarks/tts_bench` 的原版锁定环境，并准备其固定的 1,088 条
+英文 Seed-TTS prompt：
+
+```bash
+bash scripts/setup_nari_benchmark.sh
+```
+
+启动服务并注册名为 `benchmark` 的固定 voice 后，每个 RPS 点独立运行：
+
+```bash
+RPS=1 SEED=0 WARMUP=30s DURATION=5m \
+  bash scripts/run_nari_benchmark.sh
+
+RPS=6 SEED=0 WARMUP=30s DURATION=5m \
+  bash scripts/run_nari_benchmark.sh
+```
+
+脚本固定使用完整文本 HTTP、raw mono PCM16/24 kHz、Poisson open-loop arrival、
+120 秒 request timeout 和最多 4096 个 in-flight request。结果写入
+`benchmarks/results/`，每个目录包含原始请求、到达序列、音频、`summary.json` 和
+`report.txt`。没有 `DEEPGRAM_API_KEY` 时不测 WER，延迟和 underrun 不受影响。
+提交性能数字时使用上面的 30 秒 warmup / 5 分钟 measurement；快速调参可临时用
+`WARMUP=15s DURATION=60s`，但应明确标为 scout。
+
+### 本容器的 5 分钟结果
+
+单张 H100 80GB + CUDA MPS，使用上面的低延迟配置、固定 benchmark voice、
+seed 0；每个点 30 秒 warmup + 5 分钟 measurement。raw PCM 的 TTFB 与 first
+playable 相同，可视为“首个可播放 PCM/TTFP”；audible TTFA 还包含播放到首个可听声
+所需的时间。
+
+| 请求 RPS（实际） | 请求数 | TTFB p50 / p95 / p99 | audible TTFA p50 / p95 / p99 | E2E p95 | 完整返回 / underrun |
+|---:|---:|---:|---:|---:|---:|
+| 1 (1.073) | 322 | 84.2 / 186.7 / 214.8 ms | 104.2 / 206.7 / 234.8 ms | 444.7 ms | 322/322 / 0 |
+| 6 (5.853) | 1,756 | 218.1 / 422.3 / 558.7 ms | 238.1 / 442.5 / 582.8 ms | 1551.9 ms | 1,756/1,756 / 0 |
+
+RPS=1 的 322 条全部可听。RPS=6 有 1,755/1,756 条达到 audible threshold；剩余
+一条虽然完整返回 11.2 秒 PCM，但整段低于 -45 dBFS 检测阈值，因此本轮的 transport /
+capacity 成功率是 100%，语义质量门仍是 fail。没有配置 Deepgram key，所以不能报告
+WER。原始报告见 `benchmarks/results/canonical-deadline-trim-buffer400-rps-*/report.txt`。
+
+### 容量 frontier 的 60 秒 scout
+
+单张 H100 80GB + CUDA MPS，使用上面的低延迟配置、seed 0。TTFP 在不同项目中
+含义不统一，因此这里同时列客户端收到首个可播放 PCM 的 TTFB 和 Nari 定义的
+audible TTFA：
+
+| 配置 | 请求 RPS（实际） | TTFB p50 / p95 | audible TTFA p50 / p95 | 成功率 | underrun 请求 |
+|---|---:|---:|---:|---:|---:|
+| deadline-aware | 1 (1.117) | 80.8 / 201.5 ms | 341.3 / 905.6 ms | 100% | 0% |
+| deadline-aware | 6 (6.350) | 241.2 / 416.3 ms | 469.9 / 1023.0 ms | 100% | 0% |
+| deadline-aware | 8 (8.200) | 334.7 / 452.1 ms | 570.2 / 1123.5 ms | 100% | 0% |
+| deadline-aware | 10 (9.817) | 7738.9 / 12735.5 ms | 7985.9 / 13120.0 ms | 77.42% | 94.91% |
+| + silence trim / 400ms buffer | 1 (1.117) | 85.0 / 202.4 ms | 105.0 / 222.4 ms | 100% | 0% |
+| + silence trim / 400ms buffer | 6 (6.350) | 276.2 / 520.3 ms | 296.2 / 540.3 ms | 100% | 0% |
+
+旧 `(chunk_index, arrival)` 调度用完全相同的 RPS=1 arrival sequence 时，TTFB
+p95 是 28.119 秒、40.30% 请求 underrun。deadline-aware 修复将其降到
+201.5 ms 且零 underrun。当前配置的容量边界位于 8–10 RPS；RPS=8 虽然保持
+连续播放，E2E p95 已到 5.19 秒，RPS=10 则明确过载。以上是单 seed scout，完整
+原始结果位于本机 `benchmarks/results/`。上面的 5 分钟结果给出稳定点，frontier 表仍是
+单 seed scout；正式容量结论还需要 RPS=8/10 的 5 分钟、多 seed 和 WER。
+
+## Offline inference
+
+```bash
+# 单条
+python examples/offline_inference.py \
+  --ref-audio ref.wav \
+  --ref-text "参考文本" \
+  --target-text "目标文本" \
+  --output-dir results/single
+
+# 数据集批量
+python examples/offline_inference.py \
+  --dataset yuekai/seed_tts_cosy2 \
+  --split wenetspeech4tts \
+  --batch-size 8 \
+  --output-dir results/wenetspeech4tts
+```
+
+关闭 speculative decoding 用 `--draft-model none`；FlashInfer 不可用时用
+`--estimator torch`。脚本默认 `OMP_NUM_THREADS=1`，避免 vLLM EngineCore fork 后
+OpenMP runtime 冲突。
+
+## Performance notes
+
+离线 H100、200 条中文、batch size 16 的既有结果：
+
+| 配置 | LLM token/s | 平均接受长度 | 端到端 RTF |
+|---|---:|---:|---:|
+| DSpark | 9387.6 | 2.992 | 0.0110 |
+| 无 draft | 2057.5 | - | 0.0203 |
+
+DSpark 的 LLM 阶段加速为 `4.56x`。RTF 是 `(LLM + token2wav wall time) /
+audio duration`，不包含 reference frontend。
+
+主要 opt-in 旋钮：
+
+| 参数 | 作用 | 既有 H100 观测 |
+|---|---|---:|
+| `--t2w-cuda-graph-buckets 8,12,16,20,24` | batch=1 offline Flow graph | Flow `54 -> 44 ms` |
+| `--campplus-trt` | CampPlus TensorRT | embedding `58 -> 7 ms` |
+| `--hift-compile` | offline HiFT compile + bucket | HiFT `48 -> 13 ms` |
+| `--stream-graph-buckets ...` | 单 session streaming Flow graph | chunk-1 Flow `89 -> 67 ms` |
+| `--hift-graph-buckets ...` | streaming HiFT graph | chunk-1 HiFT `16.8 -> 8.9 ms` |
+| deadline-aware scheduler（默认） | 首包与播放 deadline 联合调度 | RPS=1 TTFB p95 `28.1s -> 201.5ms` |
+| `--trim-leading-silence` | 有界首段静音抑制 + startup buffer | RPS=1 audible TTFA p95 `905.6 -> 222.4ms` |
+
+CUDA Graph/compile 路径与 eager 并非逐位相同；启用新 bucket 或精度优化时应跑
+ASR/CER 质量门。Nari 方案中哪些已覆盖、哪些值得下一步实现，见
+[docs/nari-acceleration-review.md](docs/nari-acceleration-review.md)。
+
+## Tests
+
+```bash
+source scripts/env.sh
+source "$FCV_VENV/bin/activate"
+bash scripts/check.sh
+python -m pytest tests/gpu -m gpu -v
+
+python scripts/asr_check.py \
+  --wav-dir results/... \
+  --ref-json results/.../expected.json \
+  --paraformer-dir models/sherpa-onnx-paraformer-zh-2023-09-14
+```
+
+设计背景与实现计划保存在
+`docs/superpowers/specs/2026-08-05-faster-cosyvoice-design.md`。

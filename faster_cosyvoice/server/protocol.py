@@ -17,10 +17,12 @@ class SpeechRequest(BaseModel):
     input: str
     model: str = "faster-cosyvoice"
     voice: Optional[str] = None            # 已注册音色名
+    language: Optional[str] = None         # OpenAI/Nari 兼容字段；CV3 自动识别
     ref_audio: Optional[str] = None        # data:/http(s)/path
     ref_text: Optional[str] = None
     response_format: str = "wav"           # wav | pcm
     stream: bool = False
+    non_streaming_mode: bool = False       # Nari/vLLM benchmark 兼容字段
     seed: int = 42
 
     @field_validator("input")
