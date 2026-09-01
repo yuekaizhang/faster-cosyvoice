@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Run one independent Nari tts-bench rate point against faster-cosyvoice.
+# Run one independent Nari tts-bench rate point against an OpenAI speech endpoint.
 # Override settings with environment variables, for example:
 #   RPS=6 SEED=1 DURATION=5m bash scripts/run_nari_benchmark.sh
+# For vLLM-Omni, also set TARGET=vllm-omni and its BASE_URL/MODEL.
 set -euo pipefail
 
 FCV_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BENCH_VENV=${BENCH_VENV:-$FCV_ROOT/.benchmark-venv}
 DATASET=${DATASET:-$FCV_ROOT/benchmarks/data/seed-tts-eval.jsonl}
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000}
+TARGET=${TARGET:-nari}
 MODEL=${MODEL:-yuekai/Fun-CosyVoice3-0.5B-2512-LLM-HF}
 VOICE=${VOICE:-benchmark}
 LANGUAGE=${LANGUAGE:-English}
@@ -28,7 +30,7 @@ if [ -e "$OUTPUT" ]; then
 fi
 
 exec "$BENCH_VENV/bin/bench" run \
-  --target nari \
+  --target "$TARGET" \
   --base-url "$BASE_URL" \
   --model "$MODEL" \
   --voice "$VOICE" \
