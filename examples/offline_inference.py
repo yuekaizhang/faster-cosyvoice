@@ -14,10 +14,12 @@
 关闭投机解码：--draft-model none；torch estimator 降级：--estimator torch
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
 import time
+from pathlib import Path
 
 # 本环境 torchaudio 2.9 的 load/save 委托 torchcodec（缺 ffmpeg 共享库），改用 soundfile
 import soundfile as sf
@@ -26,8 +28,11 @@ import torch
 from faster_cosyvoice.assets import ensure_token2wav_assets
 from faster_cosyvoice.config import LLMConfig, Token2WavConfig
 from faster_cosyvoice.envcheck import check_environment
-from faster_cosyvoice.llm.engine import (create_offline_llm, make_sampling_params,
-                                         read_spec_counters)
+from faster_cosyvoice.llm.engine import (
+    create_offline_llm,
+    make_sampling_params,
+    read_spec_counters,
+)
 from faster_cosyvoice.llm.prompt import build_prompt
 from faster_cosyvoice.llm.tokens import SpeechTokenCodec
 from faster_cosyvoice.token2wav.frontend import RefAudioFrontend
@@ -38,9 +43,11 @@ TOKENS_PER_SECOND = 25  # 25 speech token = 1s 音频
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ref-audio"); p.add_argument("--ref-text")
+    p.add_argument("--ref-audio")
+    p.add_argument("--ref-text")
     p.add_argument("--target-text")
-    p.add_argument("--dataset"); p.add_argument("--subset", default=None)
+    p.add_argument("--dataset")
+    p.add_argument("--subset", default=None)
     p.add_argument("--split", default="test")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=8)
@@ -87,26 +94,33 @@ def load_items(args):
         items = []
         for i, row in enumerate(ds):
             audio = row["prompt_audio"]
-            if audio["bytes"] is None:
-                array, sr = sf.read(audio["path"], dtype="float32")
-            else:
-                array, sr = sf.read(io.BytesIO(audio["bytes"]), dtype="float32")
+            audio_bytes = audio["bytes"]
+            if audio_bytes is None:
+                audio_bytes = Path(audio["path"]).read_bytes()
+            array, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
             if array.ndim > 1:
                 array = array.mean(axis=1)
             items.append(dict(
                 ref_wav=torch.tensor(array, dtype=torch.float32),
                 ref_sr=sr,
                 ref_text=row["prompt_text"], target_text=row["target_text"],
-                uid=row.get("id", f"{i:05d}")))
+                uid=row.get("id", f"{i:05d}"), row_index=i,
+                prompt_audio_name=audio.get("path"),
+                prompt_audio_bytes=len(audio_bytes),
+                prompt_audio_sha256=hashlib.sha256(audio_bytes).hexdigest()))
         return items
     assert args.ref_audio and args.ref_text and args.target_text, \
         "单条模式需要 --ref-audio/--ref-text/--target-text"
+    audio_bytes = Path(args.ref_audio).read_bytes()
     array, sr = sf.read(args.ref_audio, dtype="float32")
     if array.ndim > 1:
         array = array.mean(axis=1)
     return [dict(ref_wav=torch.tensor(array, dtype=torch.float32),
                  ref_sr=sr, ref_text=args.ref_text,
-                 target_text=args.target_text, uid="single")]
+                 target_text=args.target_text, uid="single", row_index=0,
+                 prompt_audio_name=args.ref_audio,
+                 prompt_audio_bytes=len(audio_bytes),
+                 prompt_audio_sha256=hashlib.sha256(audio_bytes).hexdigest())]
 
 
 def main():
@@ -129,12 +143,37 @@ def main():
         require_draft_mirror=(draft is not None
                               and llm_cfg.repetition_penalty != 1.0))
     if problems:
-        print("环境自检失败：\n  - " + "\n  - ".join(problems)); sys.exit(1)
+        print("环境自检失败：\n  - " + "\n  - ".join(problems))
+        sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
     model_dir = ensure_token2wav_assets(t2w_cfg.model_dir)
     items = load_items(args)
     print(f"{len(items)} 条请求")
+
+    # Persist the exact per-row voice-clone protocol before model execution.
+    # This proves that every target uses its own paired prompt audio/text rather
+    # than a shared benchmark voice.
+    input_manifest_path = os.path.join(args.output_dir, "input_manifest.jsonl")
+    with open(input_manifest_path, "w") as manifest:
+        for i, item in enumerate(items):
+            manifest.write(json.dumps({
+                "row_index": item["row_index"],
+                "uid": item["uid"],
+                "prompt_audio_name": item["prompt_audio_name"],
+                "prompt_audio_bytes": item["prompt_audio_bytes"],
+                "prompt_audio_sha256": item["prompt_audio_sha256"],
+                "prompt_sample_rate": item["ref_sr"],
+                "prompt_text": item["ref_text"],
+                "target_text": item["target_text"],
+                "generation_seed": args.seed + i,
+            }, ensure_ascii=False) + "\n")
+    with open(os.path.join(args.output_dir, "run_config.json"), "w") as f:
+        json.dump({
+            **vars(args),
+            "resolved_draft_model": draft,
+            "protocol": "per-row prompt_audio + prompt_text -> target_text",
+        }, f, ensure_ascii=False, indent=2)
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.target_model)
@@ -166,7 +205,7 @@ def main():
         metrics["frontend_wall_s"] += time.perf_counter() - t0
         prompts = [build_prompt(tokenizer, it["ref_text"], it["target_text"],
                                 c.prompt_tokens_llm)
-                   for it, c in zip(batch, conds)]
+                   for it, c in zip(batch, conds, strict=True)]
         t0 = time.perf_counter()
         outs = llm.generate(
             prompts,
@@ -182,8 +221,10 @@ def main():
             metrics["output_tokens"] += len(gen.token_ids)
             metrics["finished_by_stop"] += (gen.finish_reason == "stop")
             if not speech:  # spec §7：0 个有效 token 记失败不中断整批
-                metrics["failed"].append(batch[j]["uid"]); continue
-            tokens_list.append(speech); keep.append(j)
+                metrics["failed"].append(batch[j]["uid"])
+                continue
+            tokens_list.append(speech)
+            keep.append(j)
 
         t0 = time.perf_counter()
         wavs = token2wav.offline_batch(
@@ -191,7 +232,7 @@ def main():
             max_batch=t2w_cfg.batch_size)
         metrics["t2w_wall_s"] += time.perf_counter() - t0
 
-        for j, wav in zip(keep, wavs):
+        for j, wav in zip(keep, wavs, strict=True):
             sf.write(
                 os.path.join(args.output_dir, f"{batch[j]['uid']}.wav"),
                 wav.float().squeeze(0).numpy(), 24000)
