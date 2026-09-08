@@ -18,6 +18,7 @@ def test_token2wav_defaults():
     assert c.estimator_mode == "flashinfer"
     assert c.batch_size == 8
     assert c.deadline_reserve_s == 0.1
+    assert c.scheduler_mode == "deadline"
     assert c.cuda_graph_buckets is None  # 默认关：opt-in bucketed CUDA graphs
     assert c.hift_compile is False  # 默认关：opt-in torch.compile(hift.decode)
     # [M3.5-r2] 默认关：opt-in 流式 bucketed CUDA graphs

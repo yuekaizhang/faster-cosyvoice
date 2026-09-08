@@ -29,13 +29,17 @@ class _Job:
 
 class Token2WavWorker:
     def __init__(self, token2wav, mode: str = "serial", max_batch: int = 8,
-                 deadline_reserve_s: float = 0.1, clock=time.monotonic):
+                 deadline_reserve_s: float = 0.1, clock=time.monotonic,
+                 scheduler_mode: str = "deadline"):
         assert mode in ("serial", "packed"), f"未知 mode: {mode!r}"
+        if scheduler_mode not in ("deadline", "legacy"):
+            raise ValueError("调度器必须是 deadline 或 legacy")
         if not math.isfinite(deadline_reserve_s) or deadline_reserve_s < 0:
             raise ValueError("deadline_reserve_s 必须是有限非负数")
         self._t2w = token2wav
         self._mode = mode          # [M3] packed = 跨 session 批量执行循环
         self._max_batch = max_batch
+        self._scheduler_mode = scheduler_mode
         self._deadline_reserve_s = deadline_reserve_s
         self._clock = clock
         self._pending: list[_Job] = []
@@ -119,6 +123,18 @@ class Token2WavWorker:
         ]
         if not candidates:
             return None
+        if self._scheduler_mode == "legacy":
+            # Historical scheduler: globally prefer the lowest chunk index,
+            # then admission order.  Keeping it behind an explicit switch lets
+            # benchmarks isolate the deadline-aware policy without checking
+            # out an older commit containing unrelated code changes.
+            index, selected = min(
+                candidates,
+                key=lambda item: (item[1].chunk_index, item[1].seq),
+            )
+            del self._pending[index]
+            return selected
+
         now = self._clock()
         established = [(index, job, self._deadline(job))
                        for index, job in candidates

@@ -30,6 +30,7 @@ class Token2WavConfig:
     estimator_mode: str = "flashinfer"      # flashinfer | torch
     batch_size: int = 8                     # flashinfer packed 子批上限（防 OOM）
     batch_mode: str = "packed"              # [M3] packed | serial（batcher v2；与 CLI 默认一致）
+    scheduler_mode: str = "deadline"        # deadline | legacy（仅供严格消融）
     # Nari-style playback-deadline reserve：既有 stream 剩余 buffer 小于该值
     # 时抢占 startup work。当前全前缀重算路径保守留 100ms；可由 CLI 调优。
     deadline_reserve_s: float = 0.1

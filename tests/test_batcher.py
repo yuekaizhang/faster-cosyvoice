@@ -116,6 +116,25 @@ def test_deadline_reserve_must_be_nonnegative():
         Token2WavWorker(FakeT2W(), deadline_reserve_s=-0.1)
 
 
+def test_scheduler_mode_must_be_known():
+    with pytest.raises(ValueError):
+        Token2WavWorker(FakeT2W(), scheduler_mode="unknown")
+
+
+@pytest.mark.asyncio
+async def test_legacy_scheduler_uses_chunk_index_then_arrival():
+    t2w = FakeT2W()
+    w = Token2WavWorker(t2w, scheduler_mode="legacy")
+    f_later_chunk = w.submit_nowait("older", "c3", chunk_index=3)
+    f_earlier_chunk = w.submit_nowait("newer", "c1", chunk_index=1)
+    await w.start()
+    try:
+        await asyncio.gather(f_later_chunk, f_earlier_chunk)
+        assert t2w.calls == [("newer", "c1"), ("older", "c3")]
+    finally:
+        await w.stop()
+
+
 @pytest.mark.asyncio
 async def test_submit_after_stop_raises():
     w = Token2WavWorker(FakeT2W())

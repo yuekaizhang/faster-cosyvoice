@@ -77,6 +77,8 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         state.batcher = Token2WavWorker(state.token2wav,
                                         mode=t2w_cfg.batch_mode,
                                         max_batch=t2w_cfg.batch_size,
+                                        scheduler_mode=(
+                                            t2w_cfg.scheduler_mode),
                                         deadline_reserve_s=(
                                             t2w_cfg.deadline_reserve_s))
         state.voices = {}
@@ -207,6 +209,10 @@ def main():
     p.add_argument("--t2w-deadline-reserve-ms", type=float, default=100.0,
                    help="既有音频流在 playback deadline 前多少毫秒抢占首块工作"
                         "（默认 100，Nari-style deadline-aware scheduling）")
+    p.add_argument("--t2w-scheduler", default="deadline",
+                   choices=["legacy", "deadline"],
+                   help="token2wav 调度策略；legacy=(chunk_index, arrival) "
+                        "仅用于可复现的消融实验")
     p.add_argument("--hift-compile", action="store_true",
                    help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
                         "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）。"
@@ -275,6 +281,7 @@ def main():
                               estimator_mode=args.stream_estimator,
                               batch_mode=args.t2w_batch_mode,
                               batch_size=args.t2w_batch_size,
+                              scheduler_mode=args.t2w_scheduler,
                               deadline_reserve_s=(
                                   args.t2w_deadline_reserve_ms / 1000),
                               hift_compile=args.hift_compile,
