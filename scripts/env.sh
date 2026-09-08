@@ -5,9 +5,12 @@
 FCV_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export FCV_ROOT
 
+# Some base images export UV_PROJECT_ENVIRONMENT for their own /opt venv.
+# Never let that generic setting redirect this repository's `uv sync` away
+# from the explicit faster-cosyvoice environment.
 FCV_VENV=${FCV_VENV:-$FCV_ROOT/.venv}
 export FCV_VENV
-export UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT:-$FCV_VENV}
+export UV_PROJECT_ENVIRONMENT=$FCV_VENV
 
 FCV_CACHE_DIR=${FCV_CACHE_DIR:-$FCV_ROOT/.cache}
 export FCV_CACHE_DIR
