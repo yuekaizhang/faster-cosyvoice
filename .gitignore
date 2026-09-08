@@ -2,7 +2,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .cache/
-.claude/
 .benchmark-venv/
 .venv/
 venv/
@@ -11,9 +10,4 @@ models/
 results/
 benchmarks/data/
 benchmarks/results/
-/docs/
-/scripts/
-/requirements.txt
-/clean.md
-/draft.md
 *.plan
