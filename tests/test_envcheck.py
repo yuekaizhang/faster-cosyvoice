@@ -1,4 +1,5 @@
 import builtins
+
 from faster_cosyvoice.envcheck import check_environment
 
 

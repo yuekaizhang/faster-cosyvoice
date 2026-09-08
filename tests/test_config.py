@@ -19,19 +19,18 @@ def test_token2wav_defaults():
     assert c.batch_size == 8
     assert c.deadline_reserve_s == 0.1
     assert c.scheduler_mode == "deadline"
-    assert c.cuda_graph_buckets is None  # 默认关：opt-in bucketed CUDA graphs
-    assert c.hift_compile is False  # 默认关：opt-in torch.compile(hift.decode)
-    # [M3.5-r2] 默认关：opt-in 流式 bucketed CUDA graphs
-    assert c.stream_graph_buckets is None
-    # [M3.5-r4] 默认关：opt-in 流式 hift bucketed CUDA graphs
-    assert c.hift_graph_buckets is None
+    assert c.offline_flow_graph_duration_buckets is None
+    assert c.vocoder_compile is False
+    assert c.streaming_flow_graph_buckets is None
+    assert c.streaming_vocoder_graph_buckets is None
+    assert c.speaker_encoder_tensorrt is False
 
 
 def test_server_chunk_defaults_match_current_behavior():
     """[M3.5-r2] 默认 15/×2 = M3 现行 ChunkPlanner 行为（growth 测试覆盖）。"""
     c = ServerConfig()
-    assert c.codec_chunk_frames == 15
-    assert c.codec_chunk_scale == 2
+    assert c.speech_token_chunk_size == 15
+    assert c.speech_token_chunk_growth == 2
     assert c.trim_leading_silence is False
     assert c.leading_silence_preroll_ms == 20.0
     assert c.leading_silence_max_ms == 2000.0

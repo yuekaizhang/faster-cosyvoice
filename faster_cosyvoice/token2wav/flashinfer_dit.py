@@ -22,21 +22,20 @@ Usage:
     model = CosyVoice3_Token2Wav(model_dir, enable_trt=False)
     apply_flashinfer(model, enable_cuda_graph=True)
 """
-import math
 from collections import OrderedDict
 from typing import List, Optional
 
+import flashinfer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import flashinfer
-
 from x_transformers.x_transformers import RotaryEmbedding
+
 from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.dit import InputEmbedding
 from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.modules import (
-    TimestepEmbedding,
-    DiTBlock,
     AdaLayerNormZero_Final,
+    DiTBlock,
+    TimestepEmbedding,
 )
 
 _WORKSPACE_SIZE = 64 * 1024 * 1024
@@ -517,12 +516,13 @@ class FlashInferDiT(nn.Module):
         if meta is None:
             device = x.device
             pack_idx = torch.cat([
-                torch.arange(r * maxT, r * maxT + l, device=device)
-                for r, l in enumerate(lens)])
+                torch.arange(r * maxT, r * maxT + length, device=device)
+                for r, length in enumerate(lens)])
             doc_ids = torch.repeat_interleave(
                 torch.arange(b, device=device, dtype=torch.int32), lens_t.to(device))
             pos_ids = torch.cat([
-                torch.arange(l, device=device, dtype=torch.int32) for l in lens])
+                torch.arange(length, device=device, dtype=torch.int32)
+                for length in lens])
             meta = {"pack_idx": pack_idx, "doc_ids": doc_ids, "pos_ids": pos_ids,
                     "lens": lens}
             # [M3] 有界化：流式 packed 模式下前缀逐 chunk 增长 × 批组成多样，

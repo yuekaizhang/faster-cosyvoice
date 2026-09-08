@@ -1,8 +1,10 @@
 # tests/test_engine.py
 import json
+
 import pytest
+
 from faster_cosyvoice.config import LLMConfig
-from faster_cosyvoice.llm.engine import build_llm_kwargs
+from faster_cosyvoice.llm.engine import build_llm_kwargs, make_stream_sampling_params
 
 
 def test_no_draft(tmp_path):
@@ -30,9 +32,6 @@ def test_draft_without_method_raises(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"block_size": 8}))
     with pytest.raises(ValueError):
         build_llm_kwargs(LLMConfig(target_model="m", draft_model=str(tmp_path)))
-
-
-from faster_cosyvoice.llm.engine import make_stream_sampling_params
 
 
 class FakeCodec:

@@ -27,7 +27,6 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "ruff==0.16.0",
-    "sherpa-onnx==1.13.4",
 ]
 
 [project.scripts]
@@ -40,6 +39,7 @@ include = ["faster_cosyvoice*"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["faster_cosyvoice/token2wav/cosyvoice"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "W"]

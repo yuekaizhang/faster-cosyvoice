@@ -1,17 +1,17 @@
 # examples/offline_inference.py
-"""Offline voice-clone 推理（spec §5.5/§6.1）。
+"""Offline voice-clone inference.
 
 单条：
-  python examples/offline_inference.py \
+  uv run python examples/offline_inference.py \
       --ref-audio ref.wav --ref-text "参考文本" --target-text "目标文本" \
       --output-dir results/single
 
 数据集：
-  python examples/offline_inference.py \
+  uv run python examples/offline_inference.py \
       --dataset yuekai/seed_tts_cosy2 --split wenetspeech4tts \
       --batch-size 8 --output-dir results/wenetspeech4tts
 
-关闭投机解码：--draft-model none；torch estimator 降级：--estimator torch
+关闭投机解码：--draft-model none；Torch Flow 降级：--flow-estimator torch
 """
 import argparse
 import hashlib
@@ -41,8 +41,8 @@ from faster_cosyvoice.token2wav.token2wav import CosyVoice3Token2Wav
 TOKENS_PER_SECOND = 25  # 25 speech token = 1s 音频
 
 
-def get_args():
-    p = argparse.ArgumentParser()
+def build_argument_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run batched CosyVoice3 inference.")
     p.add_argument("--ref-audio")
     p.add_argument("--ref-text")
     p.add_argument("--target-text")
@@ -54,30 +54,41 @@ def get_args():
     p.add_argument("--target-model",
                    default="yuekai/Fun-CosyVoice3-0.5B-2512-LLM-HF")
     p.add_argument("--draft-model", default="yuekai/cosyvoice3_llm_dspark",
-                   help="'none' 关闭投机解码")
+                   help="Draft model, or 'none' to disable speculative decoding.")
     p.add_argument("--token2wav-dir", default="models/Fun-CosyVoice3-0.5B-2512")
-    p.add_argument("--estimator", default="flashinfer",
+    p.add_argument("--flow-estimator", default="flashinfer",
                    choices=["flashinfer", "torch"])
+    p.add_argument("--estimator", dest="flow_estimator",
+                   choices=["flashinfer", "torch"], default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
     p.add_argument("--token2wav-batch-size", type=int, default=8)
     p.add_argument("--token2wav-device", default="cuda:0",
-                   help="token2wav/frontend 所在设备（spec D6：可与 LLM 分卡）")
-    p.add_argument("--t2w-cuda-graph-buckets", default=None,
-                   help="逗号分隔秒数（总时长 prompt+generated，如 "
-                        "'8,12,16,20,24'）：开 batch=1 offline flow 的 "
-                        "bucketed CUDA graphs；默认关")
-    p.add_argument("--campplus-trt", action="store_true",
-                   help="campplus 说话人 embedding 走 TensorRT（默认 ORT-CPU）")
-    p.add_argument("--hift-compile", action="store_true",
-                   help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
-                        "shape ~52ms → ~13-21ms；init 一次性 warmup ~15-20s）")
-    p.add_argument("--hift-graph-buckets", default=None,
-                   help="[M3.5-r4] 流式 hift bucketed CUDA graphs（逗号分隔 mel "
-                        "帧数，如 '64,128,192,256,384,512'）。仅流式中间 chunk"
-                        "（finalize=False）命中；offline 全 finalize=True 实际"
-                        "不受影响，本旋钮仅为配置贯通（见 server 同名参数）")
+                   help="Device for token2wav and the reference-audio frontend.")
+    p.add_argument("--token2wav-cuda-graph-buckets", default=None,
+                   help="Comma-separated total-duration buckets in seconds "
+                        "(reference plus generated audio), for example "
+                        "8,12,16,20,24. Used by offline batch-size-1 Flow.")
+    p.add_argument("--t2w-cuda-graph-buckets",
+                   dest="token2wav_cuda_graph_buckets",
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--speaker-encoder-tensorrt", action="store_true",
+                   help="Run the CampPlus speaker encoder with TensorRT "
+                        "instead of ONNX Runtime CPU.")
+    p.add_argument("--campplus-trt", dest="speaker_encoder_tensorrt",
+                   action="store_true", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--vocoder-compile", action="store_true",
+                   help="Compile the HiFT vocoder and pad offline inputs to "
+                        "64-Mel-frame buckets (15-20 seconds startup warmup).")
+    p.add_argument("--hift-compile", dest="vocoder_compile", action="store_true",
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p.add_argument("--output-dir", default="results/offline")
     p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+    return p
+
+
+def get_args(argv=None):
+    return build_argument_parser().parse_args(argv)
 
 
 def load_items(args):
@@ -124,22 +135,24 @@ def load_items(args):
 
 
 def main():
-    # vLLM EngineCore fork 后 OpenMP 初始化会在 --estimator torch 路径 segfault
+    # vLLM EngineCore fork 后 OpenMP 初始化会在 --flow-estimator torch 路径 segfault
     # (gomp_team_start)；OMP_NUM_THREADS=1 已验证可解，setdefault 保留用户覆盖。
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     args = get_args()
     draft = None if args.draft_model in (None, "none") else args.draft_model
     llm_cfg = LLMConfig(target_model=args.target_model, draft_model=draft)
-    t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
-                              device=args.token2wav_device,
-                              estimator_mode=args.estimator,
-                              batch_size=args.token2wav_batch_size,
-                              cuda_graph_buckets=args.t2w_cuda_graph_buckets,
-                              hift_compile=args.hift_compile,
-                              hift_graph_buckets=args.hift_graph_buckets)
+    token2wav_cfg = Token2WavConfig(
+        model_dir=args.token2wav_dir,
+        device=args.token2wav_device,
+        estimator_mode=args.flow_estimator,
+        batch_size=args.token2wav_batch_size,
+        offline_flow_graph_duration_buckets=(
+            args.token2wav_cuda_graph_buckets),
+        vocoder_compile=args.vocoder_compile,
+    )
 
     problems = check_environment(
-        require_flashinfer=(args.estimator == "flashinfer"),
+        require_flashinfer=(args.flow_estimator == "flashinfer"),
         require_draft_mirror=(draft is not None
                               and llm_cfg.repetition_penalty != 1.0))
     if problems:
@@ -147,7 +160,7 @@ def main():
         sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    model_dir = ensure_token2wav_assets(t2w_cfg.model_dir)
+    model_dir = ensure_token2wav_assets(token2wav_cfg.model_dir)
     items = load_items(args)
     print(f"{len(items)} 条请求")
 
@@ -180,19 +193,18 @@ def main():
     codec = SpeechTokenCodec(tokenizer)
     llm = create_offline_llm(llm_cfg)
     frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
-                                device=t2w_cfg.device,
-                                campplus_trt=args.campplus_trt)
-    buckets = ([float(s) for s in t2w_cfg.cuda_graph_buckets.split(",")]
-               if t2w_cfg.cuda_graph_buckets else None)
-    hift_buckets = ([int(v) for v in t2w_cfg.hift_graph_buckets.split(",")]
-                    if t2w_cfg.hift_graph_buckets else None)
-    token2wav = CosyVoice3Token2Wav(model_dir, device=t2w_cfg.device,
-                                    estimator_mode=t2w_cfg.estimator_mode,
+                                device=token2wav_cfg.device,
+                                campplus_trt=args.speaker_encoder_tensorrt)
+    buckets = ([float(s) for s in
+                token2wav_cfg.offline_flow_graph_duration_buckets.split(",")]
+               if token2wav_cfg.offline_flow_graph_duration_buckets else None)
+    token2wav = CosyVoice3Token2Wav(model_dir, device=token2wav_cfg.device,
+                                    estimator_mode=token2wav_cfg.estimator_mode,
                                     cuda_graph_buckets=buckets,
-                                    hift_compile=t2w_cfg.hift_compile,
-                                    hift_graph_buckets=hift_buckets)
+                                    hift_compile=token2wav_cfg.vocoder_compile)
 
-    metrics = dict(llm_wall_s=0.0, t2w_wall_s=0.0, frontend_wall_s=0.0,
+    metrics = dict(llm_wall_s=0.0, token2wav_wall_s=0.0,
+                   frontend_wall_s=0.0,
                    output_tokens=0, finished_by_stop=0, failed=[])
     expected = {}
     spec_before = read_spec_counters(llm)
@@ -229,8 +241,8 @@ def main():
         t0 = time.perf_counter()
         wavs = token2wav.offline_batch(
             tokens_list, [conds[j] for j in keep],
-            max_batch=t2w_cfg.batch_size)
-        metrics["t2w_wall_s"] += time.perf_counter() - t0
+            max_batch=token2wav_cfg.batch_size)
+        metrics["token2wav_wall_s"] += time.perf_counter() - t0
 
         for j, wav in zip(keep, wavs, strict=True):
             sf.write(
@@ -248,17 +260,17 @@ def main():
         spec_before.get("vllm:spec_decode_num_draft_tokens", 0)
 
     audio_s = metrics["output_tokens"] / TOKENS_PER_SECOND
-    wall = metrics["llm_wall_s"] + metrics["t2w_wall_s"]
+    wall = metrics["llm_wall_s"] + metrics["token2wav_wall_s"]
     summary = dict(
         num_items=len(items), failed=metrics["failed"],
         finished_by_stop=metrics["finished_by_stop"],
         llm_wall_s=round(metrics["llm_wall_s"], 2),
         llm_tok_per_s=round(metrics["output_tokens"]
                             / max(metrics["llm_wall_s"], 1e-9), 1),
-        t2w_wall_s=round(metrics["t2w_wall_s"], 2),
+        token2wav_wall_s=round(metrics["token2wav_wall_s"], 2),
         frontend_wall_s=round(metrics["frontend_wall_s"], 2),
         audio_seconds=round(audio_s, 1),
-        # rtf = (llm+t2w)/audio；不含 frontend（见 frontend_wall_s）
+        # rtf = (LLM + token2wav) / audio; frontend time is reported separately.
         rtf=round(wall / max(audio_s, 1e-9), 4))
     if drafts:
         summary["spec"] = dict(

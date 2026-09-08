@@ -2,9 +2,9 @@
 替代 hyperpyyaml 全量加载——那会实例化 llm/hifigan/dataset 等训练节点）。"""
 from omegaconf import DictConfig
 
+from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.dit import DiT
 from faster_cosyvoice.token2wav.cosyvoice.flow.flow import CausalMaskedDiffWithDiT
 from faster_cosyvoice.token2wav.cosyvoice.flow.flow_matching import CausalConditionalCFM
-from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.dit import DiT
 from faster_cosyvoice.token2wav.cosyvoice.hifigan.f0_predictor import CausalConvRNNF0Predictor
 from faster_cosyvoice.token2wav.cosyvoice.hifigan.generator import CausalHiFTGenerator
 from faster_cosyvoice.token2wav.cosyvoice.transformer.upsample_encoder import PreLookaheadLayer

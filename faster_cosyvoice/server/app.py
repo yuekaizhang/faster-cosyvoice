@@ -1,7 +1,7 @@
 # faster_cosyvoice/server/app.py
-"""FastAPI server（spec §5.4/§5.5）。启动：自检→资产→引擎→warmup→接流量。
+"""FastAPI server: validate, load assets, warm up, then serve traffic.
 
-用法：python -m faster_cosyvoice.server.app --port 8000 [--draft-model none]
+Run with ``uv run faster-cosyvoice-server --port 8000``.
 """
 import argparse
 import asyncio
@@ -38,20 +38,20 @@ logger = logging.getLogger(__name__)
 state = SimpleNamespace()
 
 
-def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
+def build_app(llm_cfg: LLMConfig, token2wav_cfg: Token2WavConfig,
               server_cfg: ServerConfig) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         state.ready = False
         problems = check_environment(
-            # [M3] 流式 estimator 可选 flashinfer（--stream-estimator）
-            require_flashinfer=(t2w_cfg.estimator_mode == "flashinfer"),
+            # FlashInfer is the optimized streaming Flow path; Torch is fallback.
+            require_flashinfer=(token2wav_cfg.estimator_mode == "flashinfer"),
             require_draft_mirror=(llm_cfg.draft_model is not None
                                   and llm_cfg.repetition_penalty != 1.0))
         if problems:
             raise RuntimeError("环境自检失败：" + "; ".join(problems))
-        model_dir = ensure_token2wav_assets(t2w_cfg.model_dir)
+        model_dir = ensure_token2wav_assets(token2wav_cfg.model_dir)
         from transformers import AutoTokenizer
         state.llm_cfg = llm_cfg
         state.server_cfg = server_cfg
@@ -59,28 +59,30 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
         state.codec = SpeechTokenCodec(state.tokenizer)
         state.engine = create_async_llm(llm_cfg)
         state.frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
-                                          device=t2w_cfg.device,
+                                          device=token2wav_cfg.device,
                                           cache_size=server_cfg.voice_cache_size,
-                                          campplus_trt=t2w_cfg.campplus_trt)
+                                          campplus_trt=(
+                                              token2wav_cfg
+                                              .speaker_encoder_tensorrt))
         stream_buckets = ([int(v) for v in
-                           t2w_cfg.stream_graph_buckets.split(",")]
-                          if t2w_cfg.stream_graph_buckets else None)
+                           token2wav_cfg.streaming_flow_graph_buckets.split(",")]
+                          if token2wav_cfg.streaming_flow_graph_buckets else None)
         hift_buckets = ([int(v) for v in
-                         t2w_cfg.hift_graph_buckets.split(",")]
-                        if t2w_cfg.hift_graph_buckets else None)
+                         token2wav_cfg.streaming_vocoder_graph_buckets.split(",")]
+                        if token2wav_cfg.streaming_vocoder_graph_buckets else None)
         state.token2wav = CosyVoice3Token2Wav(
-            model_dir, device=t2w_cfg.device,
-            estimator_mode=t2w_cfg.estimator_mode,
-            hift_compile=t2w_cfg.hift_compile,
+            model_dir, device=token2wav_cfg.device,
+            estimator_mode=token2wav_cfg.estimator_mode,
+            hift_compile=token2wav_cfg.vocoder_compile,
             stream_graph_buckets=stream_buckets,
             hift_graph_buckets=hift_buckets)
         state.batcher = Token2WavWorker(state.token2wav,
-                                        mode=t2w_cfg.batch_mode,
-                                        max_batch=t2w_cfg.batch_size,
+                                        mode=token2wav_cfg.batch_mode,
+                                        max_batch=token2wav_cfg.batch_size,
                                         scheduler_mode=(
-                                            t2w_cfg.scheduler_mode),
+                                            token2wav_cfg.scheduler_mode),
                                         deadline_reserve_s=(
-                                            t2w_cfg.deadline_reserve_s))
+                                            token2wav_cfg.deadline_reserve_s))
         state.voices = {}
         await state.batcher.start()
         await _warmup()
@@ -184,8 +186,15 @@ def build_app(llm_cfg: LLMConfig, t2w_cfg: Token2WavConfig,
     return app
 
 
-def main():
-    p = argparse.ArgumentParser()
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the public CLI.
+
+    Long, descriptive option names are canonical.  The earlier abbreviated
+    names remain as hidden aliases so existing deployment commands continue to
+    work while ``--help`` stays readable.
+    """
+    p = argparse.ArgumentParser(
+        description="Serve CosyVoice3 through an OpenAI-compatible speech API.")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--target-model",
@@ -195,104 +204,131 @@ def main():
     p.add_argument("--token2wav-device", default="cuda:0")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     p.add_argument("--request-timeout-s", type=float, default=300.0,
-                   help="非流式请求超时（spec §7；流式超时靠客户端）")
-    p.add_argument("--stream-estimator", default="flashinfer",
+                   help="Timeout for non-streaming requests; streaming timeouts "
+                        "are controlled by the client (default: 300).")
+    p.add_argument("--streaming-flow-estimator", default="flashinfer",
                    choices=["torch", "flashinfer"],
-                   help="[M3] 流式 flow estimator（默认 flashinfer = chunk-causal "
-                        "mask fp16 路径；torch 为回退）")
-    p.add_argument("--t2w-batch-mode", default="packed",
+                   help="Flow estimator used for streaming synthesis "
+                        "(default: flashinfer; torch is the fallback).")
+    p.add_argument("--stream-estimator", dest="streaming_flow_estimator",
+                   choices=["torch", "flashinfer"], default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--token2wav-batch-mode", default="packed",
                    choices=["serial", "packed"],
-                   help="[M3] token2wav 批量模式（默认 packed = 跨 session "
-                        "flashinfer 批量；要求 --stream-estimator flashinfer）")
-    p.add_argument("--t2w-batch-size", type=int, default=8,
-                   help="packed token2wav 最大 batch（默认 8）")
-    p.add_argument("--t2w-deadline-reserve-ms", type=float, default=100.0,
-                   help="既有音频流在 playback deadline 前多少毫秒抢占首块工作"
-                        "（默认 100，Nari-style deadline-aware scheduling）")
-    p.add_argument("--t2w-scheduler", default="deadline",
+                   help="Cross-session token2wav execution mode "
+                        "(default: packed; requires FlashInfer).")
+    p.add_argument("--t2w-batch-mode", dest="token2wav_batch_mode",
+                   choices=["serial", "packed"], default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--token2wav-batch-size", type=int, default=8,
+                   help="Maximum packed token2wav batch size (default: 8).")
+    p.add_argument("--t2w-batch-size", dest="token2wav_batch_size", type=int,
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--token2wav-deadline-reserve-ms", type=float, default=100.0,
+                   help="Prioritize an established stream when its playback "
+                        "buffer is this close to empty (default: 100 ms).")
+    p.add_argument("--t2w-deadline-reserve-ms",
+                   dest="token2wav_deadline_reserve_ms", type=float,
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--token2wav-scheduler", default="deadline",
                    choices=["legacy", "deadline"],
-                   help="token2wav 调度策略；legacy=(chunk_index, arrival) "
-                        "仅用于可复现的消融实验")
-    p.add_argument("--hift-compile", action="store_true",
-                   help="hift.decode 走 torch.compile + pad-to-bucket（fresh "
-                        "shape ~52ms → ~13-21ms；启动一次性 warmup ~15-20s）。"
-                        "注意：流式路径同走 compiled decode，波形与 eager 非逐位"
-                        "一致（worst-chunk ~6e-2，ASR CER 门通过）")
-    p.add_argument("--stream-graph-buckets", default=None,
-                   help="[M3.5-r2] 流式 bucketed CUDA graphs：逗号分隔 mel 帧数"
-                        "（如 \"512,640,768,896,1024,1280\"）。仅单 session "
-                        "流式命中；dense-SDPA graph 与 eager 非逐位一致"
-                        "（ASR CER 门为准）。每 bucket 首遇 capture ~100ms；"
-                        "warmup 会预热 warmup voice 命中的桶。建议配合 "
-                        "--codec-chunk-frames 25 --codec-chunk-scale 1 "
-                        "（chunk 形状可枚举）")
-    p.add_argument("--hift-graph-buckets", default=None,
-                   help="[M3.5-r4] 流式 hift bucketed CUDA graphs：逗号分隔 "
-                        "mel 帧数（如 \"64,128,192,256,384,512\"）。"
-                        "finalize=False 中间 chunk 整段 hift 捕成 graph"
-                        "（pad-to-bucket，数学等价 ~3e-4；最终 chunk 走原路径）。"
-                        "同卡 vLLM 抢占下 chunk-1 hift 16.8→8.9ms、TTFP "
-                        "~112→~105ms；per-bucket 首遇 lazy capture。"
-                        "质量门 = ASR CER")
-    p.add_argument("--codec-chunk-frames", type=int, default=15,
-                   help="[M3.5-r2] ChunkPlanner chunk_size（token 数；默认 15 "
-                        "= 现行行为；uniform-25 模式设 25）")
-    p.add_argument("--codec-chunk-scale", type=int, default=2,
-                   help="[M3.5-r2] hop 逐块放大倍率（默认 2 = 现行 ×2 growth；"
-                        "1 = uniform hop，chunk 形状可枚举）")
+                   help="token2wav scheduling policy (default: deadline; "
+                        "legacy is retained for compatibility experiments).")
+    p.add_argument("--t2w-scheduler", dest="token2wav_scheduler",
+                   choices=["legacy", "deadline"], default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--vocoder-compile", action="store_true",
+                   help="Compile the HiFT vocoder and quantize offline input "
+                        "lengths to 64-Mel-frame buckets. Adds 15-20 seconds "
+                        "of one-time startup warmup.")
+    p.add_argument("--hift-compile", dest="vocoder_compile", action="store_true",
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--streaming-flow-graph-buckets", default=None,
+                   help="Comma-separated streaming Flow sequence-length "
+                        "buckets in Mel frames, for example "
+                        "512,640,768,896,1024,1280. Single-session only.")
+    p.add_argument("--stream-graph-buckets",
+                   dest="streaming_flow_graph_buckets",
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--streaming-vocoder-graph-buckets", default=None,
+                   help="Comma-separated streaming vocoder input buckets in "
+                        "Mel frames, for example 64,128,192,256,384,512. "
+                        "Applies to non-final chunks only.")
+    p.add_argument("--hift-graph-buckets",
+                   dest="streaming_vocoder_graph_buckets",
+                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--speech-token-chunk-size", type=int, default=15,
+                   help="Speech tokens consumed by the first streaming hop "
+                        "(default: 15; use 25 for fixed-shape graph mode).")
+    p.add_argument("--codec-chunk-frames", dest="speech_token_chunk_size",
+                   type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument("--speech-token-chunk-growth", type=int, default=2,
+                   help="Multiplier applied to successive streaming hops "
+                        "(default: 2; use 1 for fixed-size hops).")
+    p.add_argument("--codec-chunk-scale", dest="speech_token_chunk_growth",
+                   type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     p.add_argument("--trim-leading-silence", action="store_true",
-                   help="按 Nari audible-onset 规则抑制首段静音，保留 pre-roll；"
-                        "仅影响开头 PCM，默认关闭")
+                   help="Trim bounded leading silence while retaining pre-roll. "
+                        "This changes only the beginning of the PCM stream.")
     p.add_argument("--leading-silence-preroll-ms", type=float, default=20.0,
-                   help="首段静音裁剪后保留的 pre-roll（默认 20ms）")
+                   help="Audio retained before detected speech (default: 20 ms).")
     p.add_argument("--leading-silence-max-ms", type=float, default=2000.0,
-                   help="最多等待/裁剪的首段静音窗口（默认 2000ms）")
+                   help="Maximum leading-silence window (default: 2000 ms).")
     p.add_argument("--leading-silence-min-buffer-ms", type=float, default=400.0,
-                   help="裁剪后首次发送至少累计的可播放音频（默认 400ms，"
-                        "用于避免首包过短后立即 underrun）")
-    p.add_argument("--campplus-trt", action="store_true",
-                   help="campplus 说话人 embedding 走 TensorRT（冷 ref resolve "
-                        "88.6→23.3ms，spk_emb ~58→~7ms）。首启无 plan 缓存时 "
-                        "一次性 build ~2-3min；需要 tensorrt python 包")
-    args = p.parse_args()
-    if args.t2w_batch_mode == "packed" and args.stream_estimator != "flashinfer":
-        raise SystemExit("--t2w-batch-mode packed 要求 --stream-estimator "
-                         "flashinfer（torch estimator 无 packed 批量路径）；"
-                         "--stream-estimator torch 需同时指定 "
-                         "--t2w-batch-mode serial")
-    if args.t2w_batch_size < 1:
-        raise SystemExit("--t2w-batch-size 必须 >= 1")
-    if args.t2w_deadline_reserve_ms < 0:
-        raise SystemExit("--t2w-deadline-reserve-ms 必须 >= 0")
+                   help="Playable audio buffered before the first trimmed "
+                        "response chunk (default: 400 ms).")
+    p.add_argument("--speaker-encoder-tensorrt", action="store_true",
+                   help="Run the CampPlus speaker encoder with TensorRT "
+                        "instead of ONNX Runtime CPU. The first run builds and "
+                        "caches an engine.")
+    p.add_argument("--campplus-trt", dest="speaker_encoder_tensorrt",
+                   action="store_true", default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
+    return p
+
+
+def main():
+    args = build_argument_parser().parse_args()
+    if (args.token2wav_batch_mode == "packed"
+            and args.streaming_flow_estimator != "flashinfer"):
+        raise SystemExit("--token2wav-batch-mode packed requires "
+                         "--streaming-flow-estimator flashinfer; use "
+                         "--token2wav-batch-mode serial with the torch estimator")
+    if args.token2wav_batch_size < 1:
+        raise SystemExit("--token2wav-batch-size must be >= 1")
+    if args.token2wav_deadline_reserve_ms < 0:
+        raise SystemExit("--token2wav-deadline-reserve-ms must be >= 0")
     if (args.leading_silence_preroll_ms < 0
             or args.leading_silence_max_ms < 0
             or args.leading_silence_min_buffer_ms < 0
             or args.leading_silence_preroll_ms > args.leading_silence_max_ms):
-        raise SystemExit("需满足 0 <= leading-silence-preroll-ms "
-                         "<= leading-silence-max-ms")
+        raise SystemExit("require 0 <= --leading-silence-preroll-ms "
+                         "<= --leading-silence-max-ms")
 
     import os
     os.environ.setdefault("OMP_NUM_THREADS", "1")  # 同 offline 的 fork segfault 规避
     draft = None if args.draft_model in (None, "none") else args.draft_model
     llm_cfg = LLMConfig(target_model=args.target_model, draft_model=draft,
                         gpu_memory_utilization=args.gpu_memory_utilization)
-    t2w_cfg = Token2WavConfig(model_dir=args.token2wav_dir,
-                              device=args.token2wav_device,
-                              estimator_mode=args.stream_estimator,
-                              batch_mode=args.t2w_batch_mode,
-                              batch_size=args.t2w_batch_size,
-                              scheduler_mode=args.t2w_scheduler,
-                              deadline_reserve_s=(
-                                  args.t2w_deadline_reserve_ms / 1000),
-                              hift_compile=args.hift_compile,
-                              campplus_trt=args.campplus_trt,
-                              stream_graph_buckets=args.stream_graph_buckets,
-                              hift_graph_buckets=args.hift_graph_buckets)
+    token2wav_cfg = Token2WavConfig(
+        model_dir=args.token2wav_dir,
+        device=args.token2wav_device,
+        estimator_mode=args.streaming_flow_estimator,
+        batch_mode=args.token2wav_batch_mode,
+        batch_size=args.token2wav_batch_size,
+        scheduler_mode=args.token2wav_scheduler,
+        deadline_reserve_s=args.token2wav_deadline_reserve_ms / 1000,
+        vocoder_compile=args.vocoder_compile,
+        speaker_encoder_tensorrt=args.speaker_encoder_tensorrt,
+        streaming_flow_graph_buckets=args.streaming_flow_graph_buckets,
+        streaming_vocoder_graph_buckets=args.streaming_vocoder_graph_buckets,
+    )
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
                               request_timeout_s=args.request_timeout_s,
-                              codec_chunk_frames=args.codec_chunk_frames,
-                              codec_chunk_scale=args.codec_chunk_scale,
+                              speech_token_chunk_size=args.speech_token_chunk_size,
+                              speech_token_chunk_growth=(
+                                  args.speech_token_chunk_growth),
                               trim_leading_silence=args.trim_leading_silence,
                               leading_silence_preroll_ms=(
                                   args.leading_silence_preroll_ms),
@@ -300,7 +336,7 @@ def main():
                                   args.leading_silence_max_ms),
                               leading_silence_min_buffer_ms=(
                                   args.leading_silence_min_buffer_ms))
-    uvicorn.run(build_app(llm_cfg, t2w_cfg, server_cfg),
+    uvicorn.run(build_app(llm_cfg, token2wav_cfg, server_cfg),
                 host=args.host, port=args.port, log_level="info")
 
 

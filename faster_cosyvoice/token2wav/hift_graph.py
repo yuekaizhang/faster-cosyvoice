@@ -30,7 +30,7 @@ capture 细节：
   wrapper 不进 graph）：graph 数值 == eager，与 hift_compile 是否开启解耦。
 - 返回的是静态输出 buffer 的切片视图（与 flow graph `entry["out"][:, :n]`
   同契约）：调用方须在下一次 replay 前消费（_finish_chunk 立即切片 .cpu()，
-  单 t2w 线程下安全）。
+  单 token2wav 线程下安全）。
 """
 import logging
 from typing import List

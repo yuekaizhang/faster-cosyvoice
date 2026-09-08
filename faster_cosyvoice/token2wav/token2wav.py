@@ -18,7 +18,7 @@ _HIFT_WARMUP_MAX = 1280
 
 def _enable_hift_compile(hift, device: str) -> None:
     """opt-in：torch.compile(hift.decode, dynamic=True) + finalize=True 路径的
-    mel pad-to-bucket（见 Token2WavConfig.hift_compile 注释的量化结论）。
+    mel pad-to-bucket（见 Token2WavConfig.vocoder_compile）。
 
     eager hift 每遇新 mel 长度付一次 cudnn v8 plan-build（fresh ~52-55ms，
     warm ~19ms）；inductor 的 conv1d 仍落回 ATen/cudnn，单纯 compile 不解决
@@ -38,7 +38,9 @@ def _enable_hift_compile(hift, device: str) -> None:
     import numpy as np
     ratio = int(np.prod(hift.upsample_rates)) * hift.istft_params["hop_len"]
 
-    def decode(x, s=torch.zeros(1, 1, 0), finalize=True):
+    def decode(x, s=None, finalize=True):
+        if s is None:
+            s = torch.zeros(1, 1, 0)
         if not finalize or s.shape[2] == 0:
             return compiled(x=x, s=s, finalize=finalize)
         t = x.shape[2]
@@ -134,7 +136,7 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         # [M3.5] triton (fused DiT tail / packed kernels / inductor hift) and
         # flashinfer launch on the CURRENT cuda device, which is per-thread
         # and defaults to cuda:0 — pin it to self.device so
-        # --token2wav-device cuda:1 works (also from the batcher's t2w thread).
+        # --token2wav-device cuda:1 works (also from the token2wav worker thread).
         with torch.cuda.device(self.device):
             return self._batch_impl_pinned(tokens_list, conds)
 
@@ -142,13 +144,14 @@ class CosyVoice3Token2Wav(torch.nn.Module):
         if self.estimator_mode == "flashinfer":
             from faster_cosyvoice.token2wav.flashinfer_dit import flow_inference_batched
             token_list = [c.prompt_tokens_flow + list(t)
-                          for c, t in zip(conds, tokens_list)]
+                          for c, t in zip(conds, tokens_list, strict=True)]
             prompt_feat_list = [c.prompt_feat.to(self.device) for c in conds]
             emb = torch.stack([c.spk_embedding for c in conds]).to(self.device)
             mels = flow_inference_batched(
                 self.flow, token_list, prompt_feat_list, emb)
         else:
-            mels = [self._flow_single(t, c) for t, c in zip(tokens_list, conds)]
+            mels = [self._flow_single(t, c)
+                    for t, c in zip(tokens_list, conds, strict=True)]
         return [self.hift.inference(speech_feat=mel, finalize=True)[0].cpu()
                 for mel in mels]
 
@@ -241,11 +244,10 @@ class CosyVoice3Token2Wav(torch.nn.Module):
             "stream_step_batched requires estimator_mode='flashinfer', got "
             f"{self.estimator_mode}")
         assert len(sessions) == len(plans) and len(sessions) > 0
-        from faster_cosyvoice.token2wav.flashinfer_dit import (
-            flow_inference_batched_streaming)
+        from faster_cosyvoice.token2wav.flashinfer_dit import flow_inference_batched_streaming
         token_list = [list(s.cond.prompt_tokens_flow)
                       + list(s.tokens[:p.prefix_len])
-                      for s, p in zip(sessions, plans)]
+                      for s, p in zip(sessions, plans, strict=True)]
         prompt_feat_list = [s.cond.prompt_feat.to(self.device)
                             for s in sessions]
         emb = torch.stack([s.cond.spk_embedding
@@ -256,4 +258,4 @@ class CosyVoice3Token2Wav(torch.nn.Module):
             mels = flow_inference_batched_streaming(
                 self.flow, token_list, prompt_feat_list, emb, finalize_list)
             return [self._finish_chunk(s, p, mel)
-                    for s, p, mel in zip(sessions, plans, mels)]
+                    for s, p, mel in zip(sessions, plans, mels, strict=True)]

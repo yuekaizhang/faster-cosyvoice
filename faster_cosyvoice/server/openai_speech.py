@@ -63,8 +63,8 @@ async def synthesize_pcm(state, req: SpeechRequest,
     session = StreamSession(
         cond=cond, planner=ChunkPlanner(
             len(cond.prompt_tokens_flow),
-            chunk_size=state.server_cfg.codec_chunk_frames,
-            scale=state.server_cfg.codec_chunk_scale))
+            chunk_size=state.server_cfg.speech_token_chunk_size,
+            scale=state.server_cfg.speech_token_chunk_growth))
     request_id = str(uuid.uuid4())
     ttfa_ms = None
     trimmer = (LeadingSilenceTrimmer(

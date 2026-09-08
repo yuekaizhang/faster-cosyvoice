@@ -1,11 +1,6 @@
 # tests/gpu/test_server_e2e.py
-"""server e2e：起 server → 4 并发流式 + 非流对照 → 音频断言 + ASR 门数据落盘。
+"""server e2e：起 server → 4 并发流式 + 非流对照 → 音频断言与产物落盘。
 运行：pytest tests/gpu/test_server_e2e.py -m gpu -v（容器内，~10min）
-之后跑 ASR 门：
-python scripts/asr_check.py --wav-dir results/pytest_server \
-    --ref-json results/pytest_server/expected.json \
-    --paraformer-dir models/sherpa-onnx-paraformer-zh-2023-09-14 \
-    --cer-threshold 0.15
 """
 import asyncio
 import base64
@@ -64,7 +59,7 @@ def test_server_streaming_e2e():
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT, exist_ok=True)
     # [M3] FCV_E2E_SERVER_ARGS：附加 server 启动参数（如
-    # "--stream-estimator flashinfer --t2w-batch-mode packed"），默认空。
+    # "--streaming-flow-estimator flashinfer --token2wav-batch-mode packed"），默认空。
     extra = shlex.split(os.environ.get("FCV_E2E_SERVER_ARGS", ""))
     proc = subprocess.Popen(
         [sys.executable, "-m", "faster_cosyvoice.server.app",

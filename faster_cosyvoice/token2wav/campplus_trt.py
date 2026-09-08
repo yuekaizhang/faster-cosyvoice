@@ -33,9 +33,9 @@ def _import_trt():
         return trt
     except ImportError as e:
         raise RuntimeError(
-            "campplus_trt=True 需要 tensorrt python 包但 import 失败："
-            f"{e}。请 `pip install tensorrt`（本工程验证版本 11.x），"
-            "或去掉 --campplus-trt 回退默认 ORT-CPU 路径。") from e
+            "The TensorRT speaker encoder requires the `tensorrt` Python "
+            f"package, but importing it failed: {e}. Run `uv sync --frozen`, "
+            "or omit --speaker-encoder-tensorrt to use ONNX Runtime CPU.") from e
 
 
 def convert_onnx_to_trt(plan_path: str, onnx_path: str) -> None:

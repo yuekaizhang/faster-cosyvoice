@@ -1,11 +1,11 @@
 """Register a reusable voice for the HTTP server.
 
 Local file:
-  python examples/register_voice.py --name demo --ref-audio ref.wav \
+  uv run python examples/register_voice.py --name demo --ref-audio ref.wav \
       --ref-text "Transcript of the reference audio."
 
 Cached Hugging Face dataset row:
-  python examples/register_voice.py --name benchmark \
+  uv run python examples/register_voice.py --name benchmark \
       --dataset yuekai/seed_tts_cosy2 --split test_en --index 0
 """
 import argparse

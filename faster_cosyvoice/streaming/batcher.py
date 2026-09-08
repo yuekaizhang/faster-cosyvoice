@@ -36,7 +36,7 @@ class Token2WavWorker:
             raise ValueError("调度器必须是 deadline 或 legacy")
         if not math.isfinite(deadline_reserve_s) or deadline_reserve_s < 0:
             raise ValueError("deadline_reserve_s 必须是有限非负数")
-        self._t2w = token2wav
+        self._token2wav = token2wav
         self._mode = mode          # [M3] packed = 跨 session 批量执行循环
         self._max_batch = max_batch
         self._scheduler_mode = scheduler_mode
@@ -47,7 +47,7 @@ class Token2WavWorker:
         self._wakeup: Optional[asyncio.Event] = None
         self._task: Optional[asyncio.Task] = None
         self._gpu = ThreadPoolExecutor(max_workers=1,
-                                       thread_name_prefix="t2w")
+                                       thread_name_prefix="token2wav")
         self._stopping = False
 
     async def start(self) -> None:
@@ -188,7 +188,7 @@ class Token2WavWorker:
                         continue
                     try:
                         result = await loop.run_in_executor(
-                            self._gpu, self._t2w.stream_step, session, plan)
+                            self._gpu, self._token2wav.stream_step, session, plan)
                     except Exception as e:  # noqa: BLE001 —— 只 fail 本 job，worker 存活
                         if not fut.cancelled():
                             fut.set_exception(e)
@@ -231,7 +231,7 @@ class Token2WavWorker:
         plans = [b[1] for b in batch]
         try:
             results = await loop.run_in_executor(
-                self._gpu, self._t2w.stream_step_batched, sessions, plans)
+                self._gpu, self._token2wav.stream_step_batched, sessions, plans)
         except Exception as e:  # noqa: BLE001 —— worker 存活
             # 整批失败即全批 fail：v1 可接受语义。安全性依据：flow 阶段原子；
             # _finish_chunk 阶段部分 session 可能已推进，但全批 future 均拿到

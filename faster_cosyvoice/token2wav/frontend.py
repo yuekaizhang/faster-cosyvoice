@@ -91,8 +91,10 @@ class RefAudioFrontend:
     @torch.inference_mode()
     def process_batch(self, wavs: list, sample_rates: list) -> list:
         """wavs: list of 1-D float tensor（任意采样率）→ list[RefCondition]。"""
-        wavs_16k = [self._resample(w, sr, 16000) for w, sr in zip(wavs, sample_rates)]
-        wavs_24k = [self._resample(w, sr, 24000) for w, sr in zip(wavs, sample_rates)]
+        wavs_16k = [self._resample(w, sr, 16000)
+                    for w, sr in zip(wavs, sample_rates, strict=True)]
+        wavs_24k = [self._resample(w, sr, 24000)
+                    for w, sr in zip(wavs, sample_rates, strict=True)]
 
         # s3tokenizer 批量（唯一真批量的前端模块）
         mels = [self._s3.log_mel_spectrogram(w) for w in wavs_16k]
@@ -101,7 +103,7 @@ class RefAudioFrontend:
             mels_pad.to(self.device), mels_lens.to(self.device))
 
         conds = []
-        for i, (w16, w24) in enumerate(zip(wavs_16k, wavs_24k)):
+        for i, (w16, w24) in enumerate(zip(wavs_16k, wavs_24k, strict=True)):
             tokens = tokens_pad[i, :tokens_lens[i].item()].tolist()
             mel = _mel_fn(w24.unsqueeze(0)).transpose(1, 2)  # (1, T, 80)
             spk = self._spk_embedding(w16)

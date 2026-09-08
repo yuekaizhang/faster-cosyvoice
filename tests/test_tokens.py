@@ -1,4 +1,5 @@
 import pytest
+
 from faster_cosyvoice.llm.tokens import SpeechTokenCodec
 
 

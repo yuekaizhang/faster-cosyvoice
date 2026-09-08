@@ -51,7 +51,8 @@ def _chunks(t2w, cond, tokens):
 def test_flashinfer_stream_single_session(env):
     t2w, cond = env
     parts, session = [], None
-    for session, chunk in _chunks(t2w, cond, TOKENS_A):
+    for current_session, chunk in _chunks(t2w, cond, TOKENS_A):
+        session = current_session
         assert torch.isfinite(chunk).all(), "chunk 出现 NaN/Inf"
         parts.append(chunk)
     assert len(parts) == 4, f"120 token 应产生 4 chunk，实际 {len(parts)}"

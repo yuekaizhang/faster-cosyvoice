@@ -61,7 +61,7 @@ def test_uniform_mode():
     assert (c1.prefix_len, c1.token_offset, c1.finalize) == (32, 0, False)
     # 后续每块恒 hop=25（scale=1 不增长，max_hop 封顶不生效）
     offsets = [29]
-    for k in range(3):
+    for _ in range(3):
         need = offsets[-1] + 25 + 3
         assert p.next_chunk(need - 1, finished=False) is None
         c = p.next_chunk(need, finished=False)

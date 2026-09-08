@@ -108,14 +108,14 @@ def test_stream_graph_runs_and_matches_eager(env):
 
     # (b) 逐 chunk mel 相关性门 + 实测 diff 报告（见模块 docstring）
     worst_corr, worst_mel, worst_wav = 1.0, 0.0, 0.0
-    for j, (gm, rm) in enumerate(zip(got_mels, ref_mels)):
+    for j, (gm, rm) in enumerate(zip(got_mels, ref_mels, strict=True)):
         assert gm.shape == rm.shape, f"chunk {j}: {gm.shape} vs {rm.shape}"
         c = _corr(gm, rm)
         worst_corr = min(worst_corr, c)
         worst_mel = max(worst_mel, (gm - rm).abs().max().item())
         assert c > _MEL_CORR_MIN, (
             f"chunk {j}: mel corr {c:.4f} <= {_MEL_CORR_MIN}")
-    for g, r in zip(got, ref):
+    for g, r in zip(got, ref, strict=True):
         assert g.shape == r.shape
         worst_wav = max(worst_wav, (g - r).abs().max().item())
     print(f"[stream_graph vs eager] chunks={len(got)} "
@@ -126,6 +126,7 @@ def test_stream_graph_runs_and_matches_eager(env):
     # mel 与 serial graphs-on 相关性同门
     _, _, mels_b = _run(t2w, cond, batched=True)
     assert len(mels_b) == len(got_mels)
-    worst_b = min(_corr(mb, mg) for mb, mg in zip(mels_b, got_mels))
+    worst_b = min(_corr(mb, mg)
+                  for mb, mg in zip(mels_b, got_mels, strict=True))
     print(f"[batched B=1 vs serial, graphs-on] worst_mel_corr={worst_b:.4f}")
     assert worst_b > _MEL_CORR_MIN

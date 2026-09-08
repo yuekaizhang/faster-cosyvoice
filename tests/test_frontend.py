@@ -2,8 +2,8 @@ import sys
 
 import pytest
 import torch
-from faster_cosyvoice.token2wav.frontend import (RefAudioFrontend,
-                                                 SpeakerCache, truncate_2to1)
+
+from faster_cosyvoice.token2wav.frontend import RefAudioFrontend, SpeakerCache, truncate_2to1
 
 
 def test_truncate_2to1_feat_shorter():
@@ -27,7 +27,8 @@ def test_speaker_cache_key_includes_audio_and_text():
 
 def test_speaker_cache_lru_eviction():
     c = SpeakerCache(max_size=2)
-    c.put("k1", 1); c.put("k2", 2)
+    c.put("k1", 1)
+    c.put("k2", 2)
     assert c.get("k1") == 1        # 触碰 k1
     c.put("k3", 3)                 # 淘汰 k2
     assert c.get("k2") is None and c.get("k1") == 1 and c.get("k3") == 3

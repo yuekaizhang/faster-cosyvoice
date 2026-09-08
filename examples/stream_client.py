@@ -1,10 +1,10 @@
 """Stream raw PCM, save WAV, and report Nari-compatible audible latency.
 
 Registered voice:
-  python examples/stream_client.py --voice demo --target-text "Hello." --out out.wav
+  uv run python examples/stream_client.py --voice demo --target-text "Hello." --out out.wav
 
 One-shot voice clone:
-  python examples/stream_client.py --ref-audio ref.wav --ref-text "Reference." \
+  uv run python examples/stream_client.py --ref-audio ref.wav --ref-text "Reference." \
       --target-text "Hello." --out out.wav
 """
 import argparse

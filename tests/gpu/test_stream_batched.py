@@ -84,7 +84,7 @@ def _drive_batched(t2w, cond, tokens_lists):
         if len(plans) > 1 and any(p.finalize for p in plans) \
                 and not all(p.finalize for p in plans):
             mixed_finalize_seen = True
-        for i, c in zip(idxs, chunks):
+        for i, c in zip(idxs, chunks, strict=True):
             outs[i].append(c)
     return outs, mixed_finalize_seen
 
@@ -94,7 +94,7 @@ def _compare_chunks(got, ref, label):
     assert len(got) == len(ref), (
         f"{label}: chunk 数不一致 {len(got)} vs {len(ref)}")
     exact = True
-    for j, (g, r) in enumerate(zip(got, ref)):
+    for j, (g, r) in enumerate(zip(got, ref, strict=True)):
         assert g.shape == r.shape, (
             f"{label} chunk {j}: shape {g.shape} vs {r.shape}")
         if not torch.equal(g, r):
