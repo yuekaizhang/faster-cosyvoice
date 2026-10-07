@@ -13,13 +13,11 @@
 | RTFx | 测量窗口内收到的音频总时长 / 测量窗口时长 | 越高越好；`1 RTFx` 表示实时生成 |
 
 本文统一使用 **RTFx** 表示音频吞吐。它与单请求常用的 RTF 方向相反：RTF 是计算
-时间除以音频时长，越低越好；RTFx 是单位墙钟时间生成的音频时长，越高越好。为兼容
-已有结果，图片文件名和原始 CSV 字段仍保留 `audio-xrt` 与
-`received_audio_xrt`。
+时间除以音频时长，越低越好；RTFx 是单位墙钟时间生成的音频时长，越高越好。
 
-所有测试采用 Nari-compatible client 的 closed-loop fixed-concurrency 负载。固定并发
-`C` 表示同时运行 `C` 个 worker；每个 worker 必须等待当前请求完整结束，才会发送下一
-条请求。因此，横轴表示持续存在的并发请求数，不等同于 open-loop 测试中的目标 RPS。
+固定并发 `C` 表示同时运行 `C` 个 worker；每个 worker 必须等待当前请求完整结束，
+才会发送下一条请求。因此，横轴表示持续存在的并发请求数，不等同于 open-loop 测试中
+的目标 RPS。
 
 除特别说明外，测试协议保持一致：
 
@@ -57,9 +55,8 @@ closed-loop C1 下的收益不明显；它主要用于 bursty 或 open-loop 流�
 
 ## 与其他框架对比
 
-下面使用同一个 Nari-compatible client，在固定并发下比较 Faster CosyVoice、Triton +
-TensorRT-LLM、vLLM-Omni 和 SGLang-Omni。横轴均为 outstanding requests，TTFP 越低
-越好，RTFx 越高越好。
+下面在相同的固定并发负载下比较 Faster CosyVoice、Triton Inference Server Solution
+(TRT-LLM + TRT) 和 vLLM-Omni。横轴为并发请求数，TTFP 越低越好，RTFx 越高越好。
 
 ### TTFP p50
 
@@ -73,9 +70,7 @@ TensorRT-LLM、vLLM-Omni 和 SGLang-Omni。横轴均为 outstanding requests，T
 
 ![CosyVoice3 固定并发音频吞吐 RTFx](assets/cosyvoice3-fixed-concurrency-audio-xrt.svg)
 
-Faster CosyVoice、Triton 和 vLLM-Omni 的对比数据将首块音频对齐为 760 ms。图中的
-SGLang-Omni 数据来自当时会缓存完整 waveform 的实现，首块约为 4.0–4.3 秒，因此其
-TTFP 更接近端到端延迟，不能与 760 ms streaming 首块做完全等价的延迟比较。
+Faster CosyVoice、Triton 和 vLLM-Omni 的对比数据将首块音频对齐为 760 ms。
 
 空心数据点表示该配置存在请求不完整、audibility/success 数量不一致，或模拟播放发生
 underrun。此类数据点的 RTFx 可以用于观察原始吞吐，但不应视为能够稳定连续播放的服务

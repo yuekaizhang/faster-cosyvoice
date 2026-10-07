@@ -118,12 +118,10 @@ Seed-TTS 文本和 760 ms 首块音频；测试前 warmup 15 秒，measurement �
 
 ## 致谢
 
-本项目的模型实现、推理引擎、服务设计和性能测试方法参考了以下开源项目，感谢相关
-团队和社区的工作：
+本项目的模型实现、推理引擎、服务设计和性能测试方法参考了以下开源项目，感谢相关团队和社区的工作：
 
 - [CosyVoice](https://github.com/QwenAudio/CosyVoice)
-- [vLLM](https://github.com/vllm-project/vllm)
+- [Nari Qwen3-TTS](https://github.com/nari-labs/nari-qwen3-tts)
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
 - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)
 - [SGLang-Omni](https://github.com/sgl-project/sglang-omni)
-- [Nari Qwen3-TTS](https://github.com/nari-labs/nari-qwen3-tts)
