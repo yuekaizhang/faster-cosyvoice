@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faster-cosyvoice"
+version = "0.1.0"
+description = "High-performance CosyVoice3 voice-clone inference and serving"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "datasets==5.0.1",
+    "httpx==0.28.1",
+    "librosa==0.11.0",
+    "numpy==2.3.5",
+    "omegaconf==2.3.1",
+    "onnxruntime==1.27.0",
+    "s3tokenizer==0.3.0",
+    "soundfile==0.14.0",
+    "tensorrt==11.1.0.106; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "vllm",
+    "x-transformers==2.23.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.0",
+]
+
+[project.scripts]
+faster-cosyvoice-server = "faster_cosyvoice.server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["faster_cosyvoice*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["faster_cosyvoice/token2wav/cosyvoice"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.uv]
+required-version = "==0.11.28"
+cache-dir = ".cache/uv"
+
+# DSpark repetition-penalty support is Python/Triton-only. Build the pinned
+# fork against the exact upstream CUDA 13 wheel for its base commit, avoiding
+# a local C++/CUDA build while keeping the patched Python sources in one wheel.
+[tool.uv.sources]
+vllm = { git = "https://github.com/yuekaizhang/vllm", rev = "12f64b88d5b89e6b1b86f133a7e725e371aae44d" }
+
+[tool.uv.extra-build-variables]
+vllm = { VLLM_USE_PRECOMPILED = "1", VLLM_PRECOMPILED_WHEEL_COMMIT = "88e5e2c57be8ce6e25510c1249352a23b8a85ec4", VLLM_PRECOMPILED_WHEEL_VARIANT = "cu130" }
