@@ -1,6 +1,8 @@
-# faster_cosyvoice/streaming/session.py
-"""每请求流式状态（spec §5.2/§6.2）。token2wav 模块本身无状态，
-多 session 交错依赖本对象承载缓存与 playback credit。"""
+"""Per-request state for interleaved streaming synthesis.
+
+The Token2Wav model is shared across requests.  Mutable Mel/audio offsets and
+playback credit therefore live on each :class:`StreamSession`.
+"""
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -17,7 +19,7 @@ class StreamSession:
     cond: "RefCondition"
     planner: ChunkPlanner
     tokens: List[int] = field(default_factory=list)
-    mel_cache: Optional[torch.Tensor] = None  # (1,80,T) 累计生成 mel（不含 prompt）
+    mel_cache: Optional[torch.Tensor] = None  # Generated Mel, shape (1, 80, T).
     speech_offset: int = 0
     chunk_index: int = 0
     # Nari-style playback credit.  Only publish credit when PCM crosses the

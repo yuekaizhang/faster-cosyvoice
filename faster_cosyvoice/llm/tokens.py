@@ -1,4 +1,4 @@
-"""vLLM 输出 token id → speech id 查表（不 detokenize；spec §5.1）。"""
+"""Map vLLM token IDs directly to CosyVoice speech-token IDs."""
 
 SPEECH_VOCAB_SIZE = 6561  # CV3 flow vocab_size
 
@@ -11,10 +11,11 @@ class SpeechTokenCodec:
             tid = vocab.get(f"<|s_{n}|>")
             if tid is None:
                 raise ValueError(
-                    f"词表缺 <|s_{n}|>——target 模型不是 CV3 HF checkpoint？")
+                    f"vocabulary has no <|s_{n}|>; is this a CosyVoice3 checkpoint?"
+                )
             self.id_to_speech[tid] = n
         if "<|eos1|>" not in vocab:
-            raise ValueError("词表缺 <|eos1|>")
+            raise ValueError("vocabulary has no <|eos1|>")
         self.eos_token_id: int = vocab["<|eos1|>"]
 
     def extract(self, token_ids) -> list[int]:

@@ -1,13 +1,11 @@
 # tests/gpu/test_stream_batched.py
-"""M3 Task 3 门：批量流式 flow（flow_inference_batched_streaming）+
-stream_step_batched。
-门 A：B=1 的 stream_step_batched vs 单请求 stream_step（同 flashinfer 实例、
-      同输入、fresh session）逐 chunk 比对——理想 bit-exact（torch.equal），
-      硬门 allclose(atol=1e-3)；实际相等性打印在输出里。
-门 B：B=2 混合 finalize（120 vs 260 token，两 session 的 chunk 数不同，
-      第 4 轮 A finalize=True 而 B finalize=False 同批）跑通，且每 session
-      输出与其单独 B=1 批量运行 allclose(atol=1e-3)（bit-exact 与否打印）。
-运行：pytest tests/gpu/test_stream_batched.py -m gpu -v -s（容器内）。"""
+"""Validate cross-session packed streaming Flow.
+
+A one-item packed batch must match ``stream_step`` within atol=1e-3.  A
+two-item batch with mixed final/non-final chunks must match each session's
+one-item packed baseline.  Run with
+``pytest tests/gpu/test_stream_batched.py -m gpu -v -s``.
+"""
 import pytest
 import torch
 
@@ -18,9 +16,9 @@ from faster_cosyvoice.streaming.session import StreamSession
 from faster_cosyvoice.token2wav.frontend import RefAudioFrontend
 from faster_cosyvoice.token2wav.token2wav import CosyVoice3Token2Wav
 
-# 确定性伪 token 流（值域 = FSQ 6561；同 test_stream_flashinfer）
-TOKENS_A = [(i * 37) % 6561 for i in range(120)]   # 4 chunk（最后 finalize）
-TOKENS_C = [(i * 29) % 6561 for i in range(260)]   # 6 chunk → 与 A 混合 finalize
+# Deterministic synthetic streams in the 6561-entry FSQ range.
+TOKENS_A = [(i * 37) % 6561 for i in range(120)]   # Four chunks; last is final.
+TOKENS_C = [(i * 29) % 6561 for i in range(260)]   # Six chunks; mixed with A.
 
 
 @pytest.fixture(scope="module")
@@ -29,7 +27,7 @@ def env():
     frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx")
     t2w = CosyVoice3Token2Wav(model_dir, estimator_mode="flashinfer")
     torch.manual_seed(0)
-    ref_wav = torch.randn(3 * 16000) * 0.05  # 3s 确定性噪声 ref
+    ref_wav = torch.randn(3 * 16000) * 0.05  # Three-second deterministic reference.
     cond = frontend.process(ref_wav, 16000)
     return t2w, cond
 
@@ -41,8 +39,7 @@ def _new_session(cond, tokens):
 
 
 def _next_plan(session):
-    """全部 token 已就绪的驱动：先要常规 chunk，余量不足则 finalize；
-    双 None = session 完结。"""
+    """Request a normal chunk, then finalize when only a remainder is left."""
     plan = session.planner.next_chunk(len(session.tokens), finished=False)
     if plan is None:
         plan = session.planner.next_chunk(len(session.tokens), finished=True)
@@ -50,7 +47,7 @@ def _next_plan(session):
 
 
 def _chunks_single(t2w, cond, tokens):
-    """单请求路径：逐 chunk stream_step。"""
+    """Run one session through the serial streaming path."""
     session, out = _new_session(cond, tokens), []
     while True:
         plan = _next_plan(session)
@@ -60,8 +57,7 @@ def _chunks_single(t2w, cond, tokens):
 
 
 def _drive_batched(t2w, cond, tokens_lists):
-    """批量路径：每轮收集所有活跃 session 的 plan，一次 stream_step_batched。
-    返回 (per-session chunk 列表, 是否出现过混合 finalize 批)。"""
+    """Run all active sessions once per packed step and collect their chunks."""
     sessions = [_new_session(cond, t) for t in tokens_lists]
     outs = [[] for _ in sessions]
     active = list(range(len(sessions)))
@@ -76,7 +72,7 @@ def _drive_batched(t2w, cond, tokens_lists):
             idxs.append(i)
             plans.append(plan)
             if plan.finalize:
-                active.remove(i)  # finalize chunk 之后 session 完结
+                active.remove(i)  # The session ends after its final chunk.
         if not idxs:
             break
         chunks = t2w.stream_step_batched(
@@ -90,7 +86,7 @@ def _drive_batched(t2w, cond, tokens_lists):
 
 
 def _compare_chunks(got, ref, label):
-    """硬门 allclose(atol=1e-3)，同时报告是否 bit-exact 与 max diff。"""
+    """Require atol=1e-3 and report whether the chunks are bit-exact."""
     assert len(got) == len(ref), (
         f"{label}: chunk 数不一致 {len(got)} vs {len(ref)}")
     exact = True
@@ -109,7 +105,7 @@ def _compare_chunks(got, ref, label):
 
 @pytest.mark.gpu
 def test_gate_a_b1_matches_stream_step(env):
-    """门 A：B=1 批量 == 单请求 stream_step（逐 chunk）。"""
+    """A one-item packed batch matches serial ``stream_step`` per chunk."""
     t2w, cond = env
     ref = _chunks_single(t2w, cond, TOKENS_A)
     (got,), _ = _drive_batched(t2w, cond, [TOKENS_A])
@@ -119,7 +115,7 @@ def test_gate_a_b1_matches_stream_step(env):
 
 @pytest.mark.gpu
 def test_gate_b_mixed_finalize_b2(env):
-    """门 B：B=2 混合 finalize 跑通，且各 session == 其 B=1 单跑。"""
+    """Mixed final/non-final chunks match each session's B=1 baseline."""
     t2w, cond = env
     (solo_a,), _ = _drive_batched(t2w, cond, [TOKENS_A])
     (solo_c,), _ = _drive_batched(t2w, cond, [TOKENS_C])

@@ -1,10 +1,10 @@
 # tests/gpu/test_interleave.py
-"""交错回归：锁死 stream_step 的承重不变量（spec D3/§6.2）——
-同一个 torch-mode CosyVoice3Token2Wav 实例上多 session 交错调用，
-每个 session 的输出与其独跑（solo）逐 bit 一致（torch.equal）。
-状态全在 StreamSession（mel_cache/speech_offset），模块本身无跨调用状态，
-重算确定性由 CausalConditionalCFM 的固定 rand_noise 保证。
-运行：pytest tests/gpu/test_interleave.py -m gpu -v（容器内）。"""
+"""Verify bit-exact session interleaving on one Torch Token2Wav instance.
+
+Mutable state must remain inside StreamSession, so interleaved output for each
+session equals its isolated run.  Run with
+``pytest tests/gpu/test_interleave.py -m gpu -v``.
+"""
 import pytest
 import torch
 
@@ -15,13 +15,13 @@ from faster_cosyvoice.streaming.session import StreamSession
 from faster_cosyvoice.token2wav.frontend import RefAudioFrontend
 from faster_cosyvoice.token2wav.token2wav import CosyVoice3Token2Wav
 
-# 确定性伪 token 流（值域 = FSQ 6561）
+# Deterministic synthetic speech-token streams in the 6561-entry FSQ range.
 TOKENS_A = [(i * 37) % 6561 for i in range(120)]
 TOKENS_B = [(i * 53) % 6561 for i in range(140)]
 
 
 def _chunks(t2w, cond, tokens):
-    """generator：驱动 planner 吃完 tokens，逐 chunk yield stream_step 音频。"""
+    """Drive the planner through all tokens and yield each audio chunk."""
     session = StreamSession(
         cond=cond, planner=ChunkPlanner(len(cond.prompt_tokens_flow)),
         tokens=list(tokens))
@@ -42,14 +42,14 @@ def test_interleaved_sessions_bit_exact_vs_solo():
     t2w = CosyVoice3Token2Wav(model_dir, estimator_mode="torch")
 
     torch.manual_seed(0)
-    ref_wav = torch.randn(3 * 16000) * 0.05  # 3s 确定性噪声 ref
+    ref_wav = torch.randn(3 * 16000) * 0.05  # Three-second deterministic reference.
     cond = frontend.process(ref_wav, 16000)
 
-    # 独跑基线（各自 fresh session，单独吃完）
+    # Isolated baselines with fresh sessions.
     solo_a = torch.cat(list(_chunks(t2w, cond, TOKENS_A)), dim=1)
     solo_b = torch.cat(list(_chunks(t2w, cond, TOKENS_B)), dim=1)
 
-    # 同一实例上两 session 逐 chunk 交错
+    # Interleave both sessions chunk by chunk on one model instance.
     gens = {"a": _chunks(t2w, cond, TOKENS_A),
             "b": _chunks(t2w, cond, TOKENS_B)}
     parts = {"a": [], "b": []}

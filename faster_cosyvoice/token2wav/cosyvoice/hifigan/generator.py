@@ -294,7 +294,7 @@ class SineGen2(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         # fundamental component
-        # [M3.5-r4] build the harmonic multiplier on-device: the original
+        # Build the harmonic multiplier on-device.  The original
         # `torch.FloatTensor([[range(...)]]).to(f0.device)` does a pageable H2D
         # copy per call (illegal under CUDA graph capture — see hift_graph.py).
         # Integer values are exact in fp32: numerics unchanged.

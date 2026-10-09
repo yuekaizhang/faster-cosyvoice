@@ -1,10 +1,9 @@
-# tests/test_batcher.py
 import asyncio
 from dataclasses import dataclass
 
 import pytest
 
-from faster_cosyvoice.streaming.batcher import Token2WavWorker
+from faster_cosyvoice.streaming.token2wav_batcher import Token2WavWorker
 
 
 class FakeT2W:
@@ -40,10 +39,10 @@ async def test_submit_returns_result():
 
 @pytest.mark.asyncio
 async def test_first_chunks_have_priority():
-    """老请求的后续块排队时，新请求的首块（chunk_index=0）插队。"""
+    """A new stream's first chunk precedes an established stream's next chunk."""
     t2w = FakeT2W()
     w = Token2WavWorker(t2w)
-    # 不 start worker——先塞满队列再启动，验证弹出顺序
+    # Fill the queue before starting the worker so selection order is deterministic.
     f_old = w.submit_nowait("old", "p", chunk_index=3)
     f_new = w.submit_nowait("new", "p", chunk_index=0)
     await w.start()
@@ -56,7 +55,7 @@ async def test_first_chunks_have_priority():
 
 @pytest.mark.asyncio
 async def test_urgent_established_stream_preempts_startup():
-    """Playback credit 即将耗尽时，既有 stream 必须先于新请求首块。"""
+    """A stream near underrun preempts a new stream's first chunk."""
     t2w = FakeT2W()
     w = Token2WavWorker(t2w, deadline_reserve_s=0.1,
                         clock=lambda: 10.0)
@@ -75,7 +74,7 @@ async def test_urgent_established_stream_preempts_startup():
 
 @pytest.mark.asyncio
 async def test_startup_preempts_nonurgent_established_stream():
-    """既有 stream buffer 充足时，仍优先降低新请求 TTFA。"""
+    """Startup wins when established streams have enough buffered audio."""
     t2w = FakeT2W()
     w = Token2WavWorker(t2w, deadline_reserve_s=0.1,
                         clock=lambda: 10.0)
@@ -111,9 +110,14 @@ async def test_established_streams_use_earliest_playback_deadline():
         await w.stop()
 
 
-def test_deadline_reserve_must_be_nonnegative():
+@pytest.mark.parametrize("scheduler_mode", ["deadline", "legacy"])
+def test_deadline_reserve_must_be_nonnegative(scheduler_mode):
     with pytest.raises(ValueError):
-        Token2WavWorker(FakeT2W(), deadline_reserve_s=-0.1)
+        Token2WavWorker(
+            FakeT2W(),
+            deadline_reserve_s=-0.1,
+            scheduler_mode=scheduler_mode,
+        )
 
 
 def test_scheduler_mode_must_be_known():
@@ -156,9 +160,11 @@ async def test_stop_does_not_lose_wakeup_after_draining_queue():
 
 @pytest.mark.asyncio
 async def test_submit_cancelled_on_generator_exit():
-    """消费方弃等（GeneratorExit 注入，即断连时 Starlette aclose 路径）
-    → 排队的 future 被取消。手动驱动协程注入 GeneratorExit：task.cancel()
-    会由 asyncio 自带机制取消被 await 的 future，锁不住本修复。"""
+    """GeneratorExit from a disconnected consumer cancels its queued future.
+
+    The coroutine is driven manually because task cancellation would make
+    asyncio cancel the awaited future itself and would not test worker logic.
+    """
     w = Token2WavWorker(FakeT2W())
     fut_holder = {}
     orig = w.submit_nowait
@@ -171,9 +177,9 @@ async def test_submit_cancelled_on_generator_exit():
     w.submit_nowait = spy
 
     coro = w.submit("s", "p", chunk_index=0)
-    coro.send(None)                 # 推进到 await fut 挂起（worker 未启动）
+    coro.send(None)                 # Suspend at await fut with no worker running.
     with pytest.raises(GeneratorExit):
-        coro.throw(GeneratorExit)   # 断连注入
+        coro.throw(GeneratorExit)   # Simulate Starlette closing the generator.
     assert fut_holder["fut"].cancelled()
 
 
@@ -190,7 +196,7 @@ async def test_error_fails_only_that_job():
     try:
         with pytest.raises(RuntimeError):
             await w.submit("bad", "p", chunk_index=0)
-        assert await w.submit("good", "p", chunk_index=0) == "ok"  # worker 存活
+        assert await w.submit("good", "p", chunk_index=0) == "ok"
     finally:
         await w.stop()
 
@@ -198,7 +204,7 @@ async def test_error_fails_only_that_job():
 # ---------------------------------------------------------------- packed (v2)
 
 class FakeBatchT2W:
-    """fake stream_step_batched：记录每次批量调用，按位置返回结果。"""
+    """Record packed calls and return one positional result per request."""
 
     def __init__(self):
         self.batch_calls = []
@@ -210,7 +216,7 @@ class FakeBatchT2W:
 
 @pytest.mark.asyncio
 async def test_packed_batches_distinct_sessions():
-    """3 个异 session 的 ready job → 一次批量调用收 3 个，结果按 future 路由。"""
+    """Three ready sessions form one packed call with correctly routed results."""
     t2w = FakeBatchT2W()
     w = Token2WavWorker(t2w, mode="packed", max_batch=8)
     f1 = w.submit_nowait("s1", "p1", chunk_index=0)
@@ -228,7 +234,7 @@ async def test_packed_batches_distinct_sessions():
 
 @pytest.mark.asyncio
 async def test_packed_same_session_split_across_batches():
-    """同 session 两个 chunk 不同批（mel_cache 依赖），chunk 0 先于 chunk 1。"""
+    """Dependent chunks from one session execute in separate batches."""
     t2w = FakeBatchT2W()
     w = Token2WavWorker(t2w, mode="packed", max_batch=8)
     f0 = w.submit_nowait("s1", "c0", chunk_index=0)
@@ -245,7 +251,7 @@ async def test_packed_same_session_split_across_batches():
 
 @pytest.mark.asyncio
 async def test_packed_skips_cancelled_future():
-    """组批前已取消的 future 不进批，其余 job 正常成批执行。"""
+    """Cancelled futures are omitted while remaining jobs still form a batch."""
     t2w = FakeBatchT2W()
     w = Token2WavWorker(t2w, mode="packed", max_batch=8)
     f1 = w.submit_nowait("s1", "p1", chunk_index=0)
@@ -263,7 +269,7 @@ async def test_packed_skips_cancelled_future():
 
 @pytest.mark.asyncio
 async def test_packed_batch_error_fails_whole_batch_worker_alive():
-    """批量调用抛错 → 整批 future 拿到异常（v1 可接受语义）；worker 存活。"""
+    """A packed failure fails that whole batch without killing the worker."""
 
     class BoomBatch(FakeBatchT2W):
         def __init__(self):
@@ -284,7 +290,7 @@ async def test_packed_batch_error_fails_whole_batch_worker_alive():
     try:
         r1, r2 = await asyncio.gather(f1, f2, return_exceptions=True)
         assert isinstance(r1, RuntimeError) and isinstance(r2, RuntimeError)
-        # worker 存活：后续 submit 正常
+        # A later submission proves the worker survived the batch failure.
         assert await w.submit("s3", "p3", chunk_index=0) == "pcm-s3-p3"
     finally:
         await w.stop()
@@ -307,7 +313,7 @@ async def test_packed_result_count_mismatch_fails_batch_worker_alive():
     first = w.submit_nowait("s1", "p1", chunk_index=0)
     await w.start()
     try:
-        with pytest.raises(RuntimeError, match="返回数量不匹配"):
+        with pytest.raises(RuntimeError, match="wrong result count"):
             await first
         assert await w.submit("s2", "p2", chunk_index=0) == "pcm-s2-p2"
     finally:

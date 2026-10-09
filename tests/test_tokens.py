@@ -13,7 +13,7 @@ class VocabTok:
 def test_extract_and_eos():
     c = SpeechTokenCodec(VocabTok())
     assert c.eos_token_id == 158486
-    # 非 speech token（含 eos）被滤掉
+    # Non-speech tokens, including EOS, are filtered out.
     assert c.extract([1000, 158486, 1005, 42]) == [0, 5]
 
 

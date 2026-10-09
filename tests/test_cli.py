@@ -11,10 +11,10 @@ from faster_cosyvoice.config import (
     DEFAULT_STREAMING_FLOW_GRAPH_BUCKETS,
     DEFAULT_STREAMING_VOCODER_GRAPH_BUCKETS,
 )
-from faster_cosyvoice.server.app import (
+from faster_cosyvoice.server.arguments import (
     build_argument_parser as server_parser,
 )
-from faster_cosyvoice.server.app import (
+from faster_cosyvoice.server.arguments import (
     resolve_streaming_graph_buckets,
 )
 

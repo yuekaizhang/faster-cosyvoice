@@ -1,11 +1,10 @@
 # tests/gpu/test_stream_flashinfer.py
-"""M3 Task 2 门：flashinfer 模式 stream_step（chunk-causal mask + fp16 flow）。
-(a) 单实例跑通：ChunkPlanner 驱动 120 伪 token → 4 chunk、样本数与
-    speech_offset 一致、总时长 > 3s。
-(b) 双 session 交错 vs 独跑（镜像 tests/gpu/test_interleave.py，但在
-    flashinfer 实例上）：严格 bit-exact（torch.equal）；若未来 flashinfer
-    升级导致回归，先核对失败信息里的 max-abs-diff 再考虑放宽（见内联注释）。
-运行：pytest tests/gpu/test_stream_flashinfer.py -m gpu -v（容器内）。"""
+"""Validate fp16 FlashInfer Flow with a chunk-causal streaming mask.
+
+The single-session path must produce four continuous chunks.  Interleaved
+sessions must remain bit-exact with isolated runs.  Run with
+``pytest tests/gpu/test_stream_flashinfer.py -m gpu -v``.
+"""
 import pytest
 import torch
 
@@ -16,7 +15,7 @@ from faster_cosyvoice.streaming.session import StreamSession
 from faster_cosyvoice.token2wav.frontend import RefAudioFrontend
 from faster_cosyvoice.token2wav.token2wav import CosyVoice3Token2Wav
 
-# 确定性伪 token 流（值域 = FSQ 6561；同 test_interleave）
+# Deterministic synthetic streams in the 6561-entry FSQ range.
 TOKENS_A = [(i * 37) % 6561 for i in range(120)]
 TOKENS_B = [(i * 53) % 6561 for i in range(140)]
 
@@ -27,13 +26,13 @@ def env():
     frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx")
     t2w = CosyVoice3Token2Wav(model_dir, estimator_mode="flashinfer")
     torch.manual_seed(0)
-    ref_wav = torch.randn(3 * 16000) * 0.05  # 3s 确定性噪声 ref
+    ref_wav = torch.randn(3 * 16000) * 0.05  # Three-second deterministic reference.
     cond = frontend.process(ref_wav, 16000)
     return t2w, cond
 
 
 def _chunks(t2w, cond, tokens):
-    """generator：驱动 planner 吃完 tokens，逐 chunk yield stream_step 音频。"""
+    """Drive the planner through all tokens and yield each audio chunk."""
     session = StreamSession(
         cond=cond, planner=ChunkPlanner(len(cond.prompt_tokens_flow)),
         tokens=list(tokens))
@@ -64,11 +63,11 @@ def test_flashinfer_stream_single_session(env):
 @pytest.mark.gpu
 def test_flashinfer_interleaved_sessions_vs_solo(env):
     t2w, cond = env
-    # 独跑基线（各自 fresh session，单独吃完）
+    # Isolated baselines with fresh sessions.
     solo_a = torch.cat([c for _, c in _chunks(t2w, cond, TOKENS_A)], dim=1)
     solo_b = torch.cat([c for _, c in _chunks(t2w, cond, TOKENS_B)], dim=1)
 
-    # 同一实例上两 session 逐 chunk 交错
+    # Interleave both sessions chunk by chunk on one model instance.
     gens = {"a": _chunks(t2w, cond, TOKENS_A),
             "b": _chunks(t2w, cond, TOKENS_B)}
     parts = {"a": [], "b": []}
@@ -82,10 +81,9 @@ def test_flashinfer_interleaved_sessions_vs_solo(env):
     assert len(parts["a"]) > 1 and len(parts["b"]) > 1, "应产生多个 chunk"
     inter_a = torch.cat(parts["a"], dim=1)
     inter_b = torch.cat(parts["b"], dim=1)
-    # bit-exact 成立：fa2 custom-mask 路径无 atomics，rand_noise 固定，
-    # 状态全在 StreamSession —— 与 torch 模式的 test_interleave 同级承诺。
-    # （若未来回归为非 bit-exact，先核对 max-abs-diff 再考虑放宽到
-    #   allclose(atol=1e-3)。）
+    # The custom-mask path has no atomics, uses fixed random noise, and stores
+    # mutable state only in StreamSession.  Inspect max difference before ever
+    # weakening this bit-exact invariant.
     assert torch.equal(inter_a, solo_a), (
         "session A 交错输出 != 独跑，max abs diff = "
         f"{(inter_a - solo_a).abs().max().item():.3e}")

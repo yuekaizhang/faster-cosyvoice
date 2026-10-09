@@ -22,7 +22,7 @@ def test_build_prompt_prefix_puncts_and_structure():
 
 @pytest.mark.integration
 def test_build_prompt_matches_speechspec_golden():
-    """与 SpeechSpec build_prompts 输出逐字节对齐（spec §8）。"""
+    """Prompt output remains byte-compatible with SpeechSpec."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("yuekai/Fun-CosyVoice3-0.5B-2512-LLM-HF")
     p = build_prompt(tok, "你好。", "今天天气不错。", [10, 20, 30])

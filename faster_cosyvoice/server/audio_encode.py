@@ -1,4 +1,4 @@
-"""Streaming audio encoding (spec §5.5): unknown-length WAV header once + incremental PCM_16."""
+"""Encode incremental PCM16 audio and unknown-length streaming WAV headers."""
 
 import struct
 

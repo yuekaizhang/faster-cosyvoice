@@ -1,4 +1,4 @@
-"""HF 资产下载/校验。缺失时报确切 repo id 与目标路径（spec §7 fail fast）。"""
+"""Download and validate the Token2Wav assets from Hugging Face."""
 import os
 
 TOKEN2WAV_REPO = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
@@ -21,5 +21,6 @@ def ensure_token2wav_assets(model_dir: str) -> str:
              if not os.path.isfile(os.path.join(model_dir, f))]
     if still:
         raise FileNotFoundError(
-            f"{still} 不在 {model_dir}；请检查到 {TOKEN2WAV_REPO} 的网络/凭证")
+            f"{still} are missing from {model_dir}; check network access and "
+            f"credentials for {TOKEN2WAV_REPO}")
     return model_dir

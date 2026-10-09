@@ -3,19 +3,19 @@ import inspect
 
 
 def _import_problem(mod: str) -> str | None:
-    """None = importable；否则返回失败原因（含崩溃型 import）。"""
-    # 用内建 __import__ 而非 importlib.import_module，测试才能 monkeypatch builtins.__import__
+    """Return ``None`` when a module imports, otherwise a failure reason."""
+    # Using the built-in import keeps this probe easy to monkeypatch in tests.
     try:
         __import__(mod)
         return None
     except ImportError:
-        return "不可导入"
-    except Exception as e:  # 装了但 import 崩（缺 CUDA 库等）
-        return f"导入崩溃: {e!r}"
+        return "is not importable"
+    except Exception as e:  # Installed modules can still fail on missing CUDA libraries.
+        return f"crashed during import: {e!r}"
 
 
 def _has_draft_mirror() -> bool:
-    """探测 patched vllm 的 rep-penalty mirror（vllm PR #48932）。"""
+    """Check whether vLLM supports repetition penalty in the draft model."""
     try:
         from vllm.config import SpeculativeConfig
     except Exception:
@@ -45,10 +45,12 @@ def check_environment(require_flashinfer: bool = True,
                             "or use the Torch Flow estimator")
         reason = _import_problem("triton")
         if reason is not None:
-            problems.append(f"triton {reason}（flashinfer packed 批量必需）")
+            problems.append(
+                f"triton {reason} (required for packed FlashInfer batches)"
+            )
     if require_draft_mirror and not _has_draft_mirror():
         problems.append(
-            "patched vllm 未生效（缺 draft_apply_repetition_penalty）— "
+            "the pinned vLLM patch is missing draft_apply_repetition_penalty — "
             "run `uv sync --frozen` to install the locked vLLM fork; "
             "or use --draft-model none to disable speculative decoding")
     return problems

@@ -1,15 +1,8 @@
-"""campplus 说话人 embedding 的 TensorRT 路径（opt-in，默认仍是 ORT-CPU）。
+"""Optional TensorRT path for the CampPlus speaker encoder.
 
-移植自 duplex CosyVoice runtime/triton_trtllm/token2wav_cosyvoice3.py 的
-convert_onnx_to_trt / TrtContextWrapper / load_spk_trt / forward_spk_embedding，
-按 campplus 单模型简化：fp32-only、单 context（本工程 GPU 调用已串行，
-保留 acquire/release 形状以便未来加并发）。
-
-TRT 11 相对原代码（TRT 10）的 API 变化：
-- NetworkDefinitionCreationFlag.EXPLICIT_BATCH 已移除（explicit batch 成为
-  唯一模式）→ create_network(0)。
-- 其余（build_serialized_network / execute_async_v3 / set_tensor_address /
-  set_input_shape）不变。
+The implementation is adapted from CosyVoice's Triton runtime and simplified
+to one fp32 model and one execution context.  TensorRT 11 always uses explicit
+batch mode, so the network is created with ``create_network(0)``.
 """
 import logging
 import os
@@ -19,7 +12,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# campplus.onnx：input "input" (1, T, 80) fp32 动态 T，output (1, 192)
+# campplus.onnx: dynamic fp32 input "input" (1, T, 80), output (1, 192).
 _INPUT_NAME = "input"
 _MIN_SHAPE = (1, 4, 80)
 _OPT_SHAPE = (1, 500, 80)
@@ -39,20 +32,17 @@ def _import_trt():
 
 
 def convert_onnx_to_trt(plan_path: str, onnx_path: str) -> None:
-    """campplus 专用 fp32 build（简化自 duplex convert_onnx_to_trt）。"""
+    """Build an fp32 TensorRT engine for CampPlus."""
     trt = _import_trt()
     logger.info("Converting %s -> %s ...", onnx_path, plan_path)
     trt_logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(trt_logger)
-    network = builder.create_network(0)  # TRT>=10：explicit batch 是默认且唯一
+    network = builder.create_network(0)  # Explicit batch is the only TRT >= 10 mode.
     parser = trt.OnnxParser(network, trt_logger)
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 32)  # 4GB
-    # 关 TF32（Ampere+ 默认开）保证纯 fp32。数值基准：TRT 输出与
-    # *未优化* ONNX 图（ORT_DISABLE_ALL）逐条 cos=1.000000；ORT 默认
-    # ORT_ENABLE_ALL 自己的图优化（BASIC 级即出现）会把结果推离原始图
-    # cos 0.9896~0.9998，因此 TRT vs ORT(ENABLE_ALL) 偶见 cos<0.999，
-    # 但 TRT 才是对 onnx 原图更忠实的一方（质量门以 ASR CER 对照为准）。
+    # Disable TF32 to match the original fp32 ONNX graph.  ORT's default graph
+    # optimizations can produce a larger difference than TensorRT itself.
     config.clear_flag(trt.BuilderFlag.TF32)
     with open(onnx_path, "rb") as f:
         if not parser.parse(f.read()):
@@ -70,7 +60,7 @@ def convert_onnx_to_trt(plan_path: str, onnx_path: str) -> None:
 
 
 class TrtContextWrapper:
-    """engine + context 池（同 duplex；本工程串行调用，trt_concurrent=1 足够）。"""
+    """Own a TensorRT engine and a small execution-context pool."""
 
     def __init__(self, trt_engine, trt_concurrent: int = 1,
                  device: str = "cuda:0"):
@@ -95,7 +85,7 @@ class TrtContextWrapper:
 
 def load_campplus_trt(campplus_onnx_path: str, plan_path: str,
                       device: str = "cuda:0") -> TrtContextWrapper:
-    """加载（缺失/空文件则先 build）campplus TRT engine → wrapper。"""
+    """Load a cached CampPlus engine, building it when absent or empty."""
     trt = _import_trt()
     if not os.path.exists(plan_path) or os.path.getsize(plan_path) == 0:
         convert_onnx_to_trt(plan_path, campplus_onnx_path)
@@ -109,10 +99,7 @@ def load_campplus_trt(campplus_onnx_path: str, plan_path: str,
 @torch.inference_mode()
 def spk_embedding_trt(wrapper: TrtContextWrapper,
                       feat: torch.Tensor) -> torch.Tensor:
-    """feat: (T, 80) GPU fp32（CMN 后的 kaldi fbank）→ (192,) cpu fp32。
-
-    execute_async_v3 指针绑定，同 duplex forward_spk_embedding TRT 分支。
-    """
+    """Map a normalized GPU fbank ``(T, 80)`` to a CPU embedding ``(192,)``."""
     [context, stream], engine = wrapper.acquire_estimator()
     try:
         device = torch.device(wrapper.device)

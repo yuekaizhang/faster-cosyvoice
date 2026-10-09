@@ -1,17 +1,18 @@
 # examples/offline_inference.py
 """Offline voice-clone inference.
 
-单条：
+Single request:
   uv run python examples/offline_inference.py \
-      --ref-audio ref.wav --ref-text "参考文本" --target-text "目标文本" \
+      --ref-audio ref.wav --ref-text "Reference text" --target-text "Target text" \
       --output-dir results/single
 
-数据集：
+Dataset:
   uv run python examples/offline_inference.py \
       --dataset yuekai/seed_tts_cosy2 --split wenetspeech4tts \
       --batch-size 8 --output-dir results/wenetspeech4tts
 
-关闭投机解码：--draft-model none；Torch Flow 降级：--flow-estimator torch
+Disable speculative decoding with ``--draft-model none`` or use the original
+Torch Flow implementation with ``--flow-estimator torch``.
 """
 import argparse
 import hashlib
@@ -21,16 +22,16 @@ import sys
 import time
 from pathlib import Path
 
-# 本环境 torchaudio 2.9 的 load/save 委托 torchcodec（缺 ffmpeg 共享库），改用 soundfile
+# Use soundfile because torchaudio 2.9 delegates I/O to unavailable ffmpeg libraries.
 import soundfile as sf
 import torch
 
 from faster_cosyvoice.assets import ensure_token2wav_assets
-from faster_cosyvoice.cli import parse_duration_bucket_seconds
 from faster_cosyvoice.config import (
     DEFAULT_OFFLINE_FLOW_GRAPH_BUCKET_SECONDS,
     LLMConfig,
     Token2WavConfig,
+    graph_buckets,
 )
 from faster_cosyvoice.envcheck import check_environment
 from faster_cosyvoice.llm.engine import (
@@ -43,7 +44,7 @@ from faster_cosyvoice.llm.tokens import SpeechTokenCodec
 from faster_cosyvoice.token2wav.frontend import RefAudioFrontend
 from faster_cosyvoice.token2wav.token2wav import CosyVoice3Token2Wav
 
-TOKENS_PER_SECOND = 25  # 25 speech token = 1s 音频
+TOKENS_PER_SECOND = 25  # CosyVoice3 emits 25 speech tokens per audio second.
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -80,7 +81,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     flow_graph_group.add_argument(
         "--offline-flow-graph-bucket-seconds",
         dest="offline_flow_graph_duration_buckets",
-        type=parse_duration_bucket_seconds,
+        type=graph_buckets.parse_seconds,
         metavar="SECONDS",
         default=None,
         help="Comma-separated total-context duration buckets in seconds for "
@@ -90,7 +91,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--token2wav-cuda-graph-buckets",
         "--t2w-cuda-graph-buckets",
         dest="offline_flow_graph_duration_buckets",
-        type=parse_duration_bucket_seconds,
+        type=graph_buckets.parse_seconds,
         default=argparse.SUPPRESS,
         help=argparse.SUPPRESS,
     )
@@ -132,7 +133,7 @@ def load_items(args):
 
         from datasets import Audio, load_dataset
         ds = load_dataset(args.dataset, args.subset, split=args.split)
-        # datasets>=5 的 Audio 解码依赖 torchcodec/ffmpeg，这里用 soundfile 自行解码
+        # datasets>=5 delegates Audio decoding to torchcodec/ffmpeg; decode here instead.
         ds = ds.cast_column("prompt_audio", Audio(decode=False))
         if args.limit:
             ds = ds.select(range(min(args.limit, len(ds))))
@@ -169,8 +170,8 @@ def load_items(args):
 
 
 def main():
-    # vLLM EngineCore fork 后 OpenMP 初始化会在 --flow-estimator torch 路径 segfault
-    # (gomp_team_start)；OMP_NUM_THREADS=1 已验证可解，setdefault 保留用户覆盖。
+    # Avoid gomp_team_start crashes when OpenMP initializes after EngineCore forks.
+    # setdefault preserves an explicit deployment-level override.
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     args = get_args()
     draft = None if args.draft_model in (None, "none") else args.draft_model
@@ -265,7 +266,7 @@ def main():
             speech = codec.extract(gen.token_ids)
             metrics["output_tokens"] += len(gen.token_ids)
             metrics["finished_by_stop"] += (gen.finish_reason == "stop")
-            if not speech:  # spec §7：0 个有效 token 记失败不中断整批
+            if not speech:  # Fail this item without aborting the rest of the batch.
                 metrics["failed"].append(batch[j]["uid"])
                 continue
             tokens_list.append(speech)

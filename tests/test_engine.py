@@ -24,7 +24,7 @@ def test_draft_auto_config(tmp_path):
         "method": "dspark",
         "num_speculative_tokens": 7,
         "draft_sample_method": "probabilistic",
-        "draft_apply_repetition_penalty": True,  # rp=1.1 默认 → mirror 开
+        "draft_apply_repetition_penalty": True,  # Enabled by the default penalty of 1.1.
     }
 
 

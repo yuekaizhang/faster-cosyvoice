@@ -1,5 +1,8 @@
-"""直接构造 flow/hift（超参硬编码自 Fun-CosyVoice3-0.5B-2512/cosyvoice3.yaml，
-替代 hyperpyyaml 全量加载——那会实例化 llm/hifigan/dataset 等训练节点）。"""
+"""Construct Flow and HiFT from the released CosyVoice3 model parameters.
+
+Building the two inference modules directly avoids HyperPyYAML instantiating
+unneeded training, dataset, and LLM objects.
+"""
 from omegaconf import DictConfig
 
 from faster_cosyvoice.token2wav.cosyvoice.flow.DiT.dit import DiT

@@ -1,6 +1,7 @@
-"""CV3 voice-clone prompt 构建（迁自 SpeechSpec benchmark_tts.py，逐字节一致）。"""
+"""Build CosyVoice3 voice-cloning prompts compatible with SpeechSpec."""
 
-PUNCTS = ['"', "(", ")", "“", "”", "‘", "（", "）", "'"]  # NOTE: 不对称（有'‘'无'’'）是有意的——与 SpeechSpec benchmark_tts.py 字节兼容，勿"修复"
+# The asymmetric quote set intentionally matches SpeechSpec byte for byte.
+PUNCTS = ['"', "(", ")", "“", "”", "‘", "（", "）", "'"]
 COSYVOICE3_PREFIX = "You are a helpful assistant.<|endofprompt|>"
 
 

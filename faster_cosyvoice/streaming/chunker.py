@@ -1,9 +1,9 @@
-# faster_cosyvoice/streaming/chunker.py
-"""token→chunk 纯数学状态机（vllm-omni talker2code2wav_async_chunk 语义，spec §5.3）。
+"""Plan streaming chunks from an incrementally growing speech-token sequence.
 
-lookahead 只重发不消费；pad 仅首块；hop 逐块 ×2 封顶 4×chunk_size；
-LLM 结束后余量一次 finalize（不要求 lookahead，哪怕不足一个 hop）。
-常数 15/3/×2/60 出处：vllm-omni deploy/cosyvoice3.yaml codec_chunk_frames=15。
+Lookahead tokens are resent but not consumed.  Prompt-alignment padding applies
+only to the first chunk.  The default hop doubles until it reaches four times
+the initial chunk size.  Once the LLM finishes, any remainder becomes one final
+chunk even when it is shorter than a normal hop.
 """
 import math
 from dataclasses import dataclass
@@ -12,8 +12,8 @@ from typing import Optional
 
 @dataclass
 class ChunkPlan:
-    prefix_len: int    # flow 输入 = tokens[:prefix_len]（非 final 含 lookahead）
-    token_offset: int  # 本块之前已消费 token 数 = mel 切片起点（×token_mel_ratio）
+    prefix_len: int    # Flow reads tokens[:prefix_len], including lookahead.
+    token_offset: int  # Tokens consumed before this chunk; maps to a Mel offset.
     finalize: bool
 
 
@@ -28,13 +28,15 @@ class ChunkPlanner:
         self.hop = chunk_size
         self.pad = ((math.ceil(prompt_token_len / chunk_size) * chunk_size
                      - prompt_token_len) if prompt_token_len > 0 else 0)
-        self.emitted = 0  # 已消费 token 数
+        self.emitted = 0
 
     def next_chunk(self, available_total: int,
                    finished: bool) -> Optional[ChunkPlan]:
-        """None 有两义：finished=False 时表示"等更多 token"；
-        finished=True 时表示"没有余量了"。调用方以
-        `finished and plan is None` 作为循环退出条件。"""
+        """Return the next runnable chunk, or ``None``.
+
+        Before the LLM finishes, ``None`` means more tokens are required.  Once
+        it has finished, ``None`` means all remaining tokens were consumed.
+        """
         available = available_total - self.emitted
         this_hop = self.hop + (self.pad if self.emitted == 0 else 0)
         if not finished:

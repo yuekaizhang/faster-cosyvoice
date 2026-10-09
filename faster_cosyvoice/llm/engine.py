@@ -1,10 +1,8 @@
-# faster_cosyvoice/llm/engine.py
-"""vLLM 引擎参数组装（纯函数，可 CPU 单测）+ 引擎/采样工厂。
+"""vLLM engine construction, DSpark configuration, and sampling helpers.
 
-speculative_config 组装逻辑与 SpeechSpec benchmark_tts.py 一致：
-method ← draft config.json 的 speculators_model_type，
-num_speculative_tokens ← block_size - 1，
-rp != 1.0 时开 draft_apply_repetition_penalty（vllm PR #48932 mirror）。
+Both offline and server engines call :func:`build_llm_kwargs`, so speculative
+decoding is configured identically in both paths.  The draft checkpoint's
+``config.json`` supplies its method and block size.
 """
 import json
 import logging
@@ -14,6 +12,7 @@ from faster_cosyvoice.config import LLMConfig
 
 
 def load_draft_config(draft_model: str) -> dict:
+    """Load a draft checkpoint config from a local path or Hugging Face."""
     local = os.path.join(draft_model, "config.json")
     if os.path.isfile(local):
         with open(local) as f:
@@ -23,30 +22,48 @@ def load_draft_config(draft_model: str) -> dict:
         return json.load(f)
 
 
-def build_llm_kwargs(cfg: LLMConfig) -> dict:
-    kwargs = dict(
-        model=cfg.target_model,
-        gpu_memory_utilization=cfg.gpu_memory_utilization,
-        max_model_len=cfg.max_model_len,
-        disable_log_stats=False,
+def build_speculative_config(cfg: LLMConfig) -> dict | None:
+    """Translate :class:`LLMConfig` into vLLM's speculative config.
+
+    DSpark predicts one block that includes the current token, so a draft block
+    of size ``N`` contributes ``N - 1`` speculative tokens.  Repetition-penalty
+    mirroring requires the patched vLLM pinned in ``pyproject.toml``.
+    """
+    if not cfg.draft_model:
+        return None
+
+    draft_config = load_draft_config(cfg.draft_model)
+    method = cfg.method or draft_config.get("speculators_model_type")
+    if method is None:
+        raise ValueError(
+            "draft config.json has no speculators_model_type; set method explicitly"
+        )
+    block_size = draft_config.get("block_size")
+    num_speculative_tokens = cfg.num_spec_tokens or (
+        block_size - 1 if block_size else 3
     )
-    if cfg.draft_model:
-        dc = load_draft_config(cfg.draft_model)
-        method = cfg.method or dc.get("speculators_model_type")
-        if method is None:
-            raise ValueError("draft config.json 缺 speculators_model_type；"
-                             "请显式传 method")
-        block = dc.get("block_size")
-        num_spec = cfg.num_spec_tokens or ((block - 1) if block else 3)
-        sc = {
-            "model": cfg.draft_model,
-            "method": method,
-            "num_speculative_tokens": num_spec,
-            "draft_sample_method": cfg.draft_sample_method,
-        }
-        if cfg.repetition_penalty != 1.0:
-            sc["draft_apply_repetition_penalty"] = True
-        kwargs["speculative_config"] = sc
+    speculative_config = {
+        "model": cfg.draft_model,
+        "method": method,
+        "num_speculative_tokens": num_speculative_tokens,
+        "draft_sample_method": cfg.draft_sample_method,
+    }
+    if cfg.repetition_penalty != 1.0:
+        speculative_config["draft_apply_repetition_penalty"] = True
+    return speculative_config
+
+
+def build_llm_kwargs(cfg: LLMConfig) -> dict:
+    """Build arguments shared by vLLM's offline and asynchronous engines."""
+    kwargs = {
+        "model": cfg.target_model,
+        "gpu_memory_utilization": cfg.gpu_memory_utilization,
+        "max_model_len": cfg.max_model_len,
+        "disable_log_stats": False,
+    }
+    speculative_config = build_speculative_config(cfg)
+    if speculative_config is not None:
+        kwargs["speculative_config"] = speculative_config
     return kwargs
 
 
@@ -75,8 +92,11 @@ def read_spec_counters(llm) -> dict:
 
 
 def create_async_llm(cfg: LLMConfig):
-    """server 用异步引擎（spec §5.1）。构造即拉起 engine-core 子进程
-    （阻塞加载）——放 FastAPI lifespan；teardown 调 engine.shutdown()。"""
+    """Create the server engine and its EngineCore subprocess.
+
+    Construction blocks while weights load, so the server calls this inside
+    the FastAPI lifespan and shuts it down during lifespan teardown.
+    """
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     return AsyncLLM.from_engine_args(
@@ -85,9 +105,12 @@ def create_async_llm(cfg: LLMConfig):
 
 def make_stream_sampling_params(cfg: LLMConfig, codec, text_token_len: int,
                                 seed: int):
-    """流式采样参数：DELTA 增量、不 detokenize（stop 字符串会 raise，
-    用 stop_token_ids）、动态 min/max（vllm-omni 同款 2×/20× 比例）。
-    min_tokens 到达前 vLLM 会抑制一切 stop（含 eos）。"""
+    """Build streaming parameters with dynamic output-length bounds.
+
+    vLLM emits token deltas without detokenizing.  The minimum and maximum are
+    respectively 2x and 20x the input text-token count, capped by the model
+    limit.  vLLM suppresses EOS until ``min_tokens`` has been reached.
+    """
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
     max_tok = max(1, min(cfg.max_tokens, 20 * text_token_len))
@@ -103,8 +126,11 @@ def make_stream_sampling_params(cfg: LLMConfig, codec, text_token_len: int,
 
 
 async def stream_token_ids(engine, prompt: str, sp, request_id: str):
-    """AsyncLLM DELTA 流 → 逐次 yield (delta_token_ids, finished)。
-    消费方取消（客户端断连）时生成器关闭即自动 abort 引擎侧请求。"""
+    """Yield ``(delta_token_ids, finished)`` from an AsyncLLM request.
+
+    Closing this generator after a client disconnect propagates cancellation
+    to vLLM, which aborts the engine-side request.
+    """
     async for out in engine.generate(prompt, sp, request_id):
         yield list(out.outputs[0].token_ids), out.finished
         if out.finished:

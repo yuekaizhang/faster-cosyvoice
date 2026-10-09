@@ -1,4 +1,4 @@
-"""Runtime configuration and documented defaults."""
+"""Typed runtime settings and their documented defaults."""
 
 from dataclasses import dataclass
 from typing import Optional

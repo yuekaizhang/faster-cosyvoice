@@ -1,10 +1,10 @@
 # tests/gpu/test_hift_graph.py
-"""[M3.5-r4] 流式 hift bucketed CUDA graph 门（hift_graph.py）：
-门 A：graph 路径（pad-to-bucket + L(T) 切片）vs eager finalize=False，
-      多个 T（跨桶）shape 相同且 allclose(atol=5e-3)；实测 max diff ~2e-4
-      （padded 形状改变 cudnn/cuFFT 算法选择 + 手写 istft，非逐位一致）。
-门 B：finalize=True 与超长（> max bucket）回退原路径（bit-exact）。
-运行：pytest tests/gpu/test_hift_graph.py -m gpu -v -s（容器内）。"""
+"""Validate bucketed streaming HiFT CUDA Graphs against eager inference.
+
+Non-final graph calls must match shape and stay within atol=5e-3 across
+buckets.  Final and overlong calls must fall back to bit-exact eager output.
+Run with ``pytest tests/gpu/test_hift_graph.py -m gpu -v -s``.
+"""
 import pytest
 import torch
 
@@ -25,7 +25,7 @@ def env():
         f"{model_dir}/hift.pt", map_location="cpu", weights_only=True).items()}
     hift.load_state_dict(sd, strict=True)
     hift.to(device).eval()
-    eager_inference = hift.inference  # graph install 前的原始入口
+    eager_inference = hift.inference  # Save the original entry point.
     HiftStreamGraph(hift, device, BUCKETS).install()
     return hift, eager_inference, device
 
@@ -38,7 +38,7 @@ def test_gate_a_graph_matches_eager(env):
         mel = torch.randn(1, 80, t, device=device) * 2 - 6.0
         ref, _ = eager_inference(speech_feat=mel.clone(), finalize=False)
         got, _ = hift.inference(speech_feat=mel.clone(), finalize=False)
-        got = got.clone()  # 静态 buffer 视图 → 消费前固化
+        got = got.clone()  # Materialize the static-buffer view before replay.
         assert got.shape == ref.shape, (t, got.shape, ref.shape)
         assert torch.isfinite(got).all()
         diff = (got - ref).abs().max().item()
@@ -51,12 +51,12 @@ def test_gate_a_graph_matches_eager(env):
 def test_gate_b_fallback_paths(env):
     hift, eager_inference, device = env
     torch.manual_seed(1)
-    # finalize=True → 原路径（bit-exact）
+    # Final chunks use the original path and remain bit-exact.
     mel = torch.randn(1, 80, 100, device=device) * 2 - 6.0
     ref, _ = eager_inference(speech_feat=mel.clone(), finalize=True)
     got, _ = hift.inference(speech_feat=mel.clone(), finalize=True)
     assert torch.equal(got, ref)
-    # 超过最大桶 → 原路径（bit-exact）
+    # Inputs beyond the largest bucket also use the original path.
     mel = torch.randn(1, 80, BUCKETS[-1] + 32, device=device) * 2 - 6.0
     ref, _ = eager_inference(speech_feat=mel.clone(), finalize=False)
     got, _ = hift.inference(speech_feat=mel.clone(), finalize=False)

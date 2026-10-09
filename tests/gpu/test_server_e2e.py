@@ -1,6 +1,7 @@
 # tests/gpu/test_server_e2e.py
-"""server e2e：起 server → 4 并发流式 + 非流对照 → 音频断言与产物落盘。
-运行：pytest tests/gpu/test_server_e2e.py -m gpu -v（容器内，~10min）
+"""Start the server, run four streams plus one offline request, and validate audio.
+
+Run with ``pytest tests/gpu/test_server_e2e.py -m gpu -v``; it takes about ten minutes.
 """
 import asyncio
 import base64
@@ -32,7 +33,7 @@ def _ref_data_url():
     ds = load_dataset("yuekai/seed_tts_cosy2", split="wenetspeech4tts")
     ds = ds.cast_column("prompt_audio", Audio(decode=False))
     row = ds[0]
-    # 数据集行的 bytes 是完整 wav 文件（M1 已验证），直接 base64。
+    # Dataset bytes contain a complete WAV file and can be encoded directly.
     b64 = base64.b64encode(row["prompt_audio"]["bytes"]).decode()
     return "data:audio/wav;base64," + b64, row["prompt_text"]
 
@@ -47,7 +48,7 @@ async def _stream_one(client, ref_url, ref_text, text, idx):
                              timeout=300) as r:
         assert r.status_code == 200
         async for chunk in r.aiter_bytes():
-            if ttfa is None and len(data) + len(chunk) > 44:  # 首个音频字节
+            if ttfa is None and len(data) + len(chunk) > 44:  # First audio byte.
                 ttfa = time.perf_counter() - t0
             data += chunk
     pcm = np.frombuffer(data[44:], dtype="<i2").astype(np.float32) / 32767
@@ -58,14 +59,13 @@ async def _stream_one(client, ref_url, ref_text, text, idx):
 def test_server_streaming_e2e():
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT, exist_ok=True)
-    # [M3] FCV_E2E_SERVER_ARGS：附加 server 启动参数（如
-    # "--streaming-flow-estimator flashinfer --token2wav-batch-mode packed"），默认空。
+    # FCV_E2E_SERVER_ARGS appends optional server flags for configuration tests.
     extra = shlex.split(os.environ.get("FCV_E2E_SERVER_ARGS", ""))
     proc = subprocess.Popen(
         [sys.executable, "-m", "faster_cosyvoice.server.app",
          "--port", str(PORT), *extra])
     try:
-        # 等 server ready（warmup 含引擎加载，给足时间）
+        # Engine loading is part of warmup, so readiness gets a generous timeout.
         deadline = time.time() + 900
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -97,7 +97,7 @@ def test_server_streaming_e2e():
             expected[f"stream_{i}"] = TEXTS[i]
         print("TTFA(ms):", [round(t * 1000) for t, _ in results])
 
-        # 非流式对照（同 seed 同请求 → spec §8 流/非流一致性经 ASR 门）
+        # Generate the same seeded request through the non-streaming path.
         req = dict(input=TEXTS[0], ref_audio=ref_url, ref_text=ref_text,
                    stream=False, response_format="wav", seed=100)
         r = httpx.post(f"{URL}/v1/audio/speech", json=req, timeout=300)

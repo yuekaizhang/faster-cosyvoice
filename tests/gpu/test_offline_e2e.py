@@ -1,5 +1,5 @@
 # tests/gpu/test_offline_e2e.py
-"""容器内运行：pytest tests/gpu -m gpu -v。跑通 offline 全链路并做基本音频断言。"""
+"""Run offline inference end to end and validate the generated audio."""
 import json
 import os
 import shutil
@@ -22,7 +22,7 @@ def test_offline_e2e_dataset():
     subprocess.run(cmd, check=True, timeout=1800)
     metrics = json.load(open(os.path.join(OUT, "metrics.json")))
     assert metrics["failed"] == []
-    assert metrics["finished_by_stop"] >= 3  # 允许个别 length 截断
+    assert metrics["finished_by_stop"] >= 3  # Allow an occasional length truncation.
     wavs = [f for f in os.listdir(OUT) if f.endswith(".wav")]
     assert len(wavs) == 4
     for f in wavs:

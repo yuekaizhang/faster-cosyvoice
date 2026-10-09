@@ -1,8 +1,8 @@
-"""Ref 音频前端：s3tokenizer(v3_25hz, GPU) + campplus(ORT-CPU) + prompt mel。
+"""Turn reference audio into the conditions shared by the LLM and Flow.
 
-RefCondition 同时服务 LLM（未截断 token）与 flow（2:1 截断的 token/feat 对）。
-speaker cache key = sha256(音频字节)+ref_text（修 triton 版按 ref_text 碰撞的缺陷，
-spec §5.2）。M1 offline 每行 ref 各不相同，cache 主要为 M2 server 铺路。
+The frontend combines the 25 Hz S3 tokenizer, a CampPlus speaker encoder, and
+prompt Mel features.  The LLM receives the full speech-token sequence, while
+Flow receives a token/feature pair truncated to its required 1:2 ratio.
 """
 import hashlib
 import os
@@ -22,14 +22,14 @@ _mel_fn = partial(mel_spectrogram, n_fft=1920, num_mels=80, sampling_rate=24000,
 
 @dataclass
 class RefCondition:
-    prompt_tokens_llm: list      # 未截断，进 LLM prompt
-    prompt_tokens_flow: list     # 2:1 截断，进 flow
-    prompt_feat: torch.Tensor    # (1, 2*len(prompt_tokens_flow), 80)，cpu fp32
-    spk_embedding: torch.Tensor  # (192,)，cpu fp32
+    prompt_tokens_llm: list      # Full token sequence for the LLM prompt.
+    prompt_tokens_flow: list     # Truncated to match two Mel frames per token.
+    prompt_feat: torch.Tensor    # CPU fp32, shape (1, 2 * token_count, 80).
+    spk_embedding: torch.Tensor  # CPU fp32, shape (192,).
 
 
 def truncate_2to1(tokens: list, feat_len: int) -> tuple:
-    """prompt feat/token 对齐到 2:1（同 duplex forward() 与 triton BLS）。"""
+    """Align prompt speech tokens and Mel features to Flow's 1:2 ratio."""
     token_len = min(feat_len // 2, len(tokens))
     return tokens[:token_len], 2 * token_len
 
@@ -62,8 +62,8 @@ class RefAudioFrontend:
     def __init__(self, campplus_onnx_path: str, device: str = "cuda:0",
                  cache_size: int = 256, campplus_trt: bool = False):
         self.device = device
-        # campplus TRT（opt-in；默认 ORT-CPU）。放最前：import/build 失败要在
-        # 任何重加载前 fail loud（campplus_trt._import_trt 给出可操作的报错）。
+        # Fail on TensorRT import/build errors before loading the other models.
+        # The default path keeps CampPlus on ONNX Runtime CPU.
         self._campplus_trt = None
         if campplus_trt:
             from faster_cosyvoice.token2wav import campplus_trt as _ctrt
@@ -90,13 +90,13 @@ class RefAudioFrontend:
 
     @torch.inference_mode()
     def process_batch(self, wavs: list, sample_rates: list) -> list:
-        """wavs: list of 1-D float tensor（任意采样率）→ list[RefCondition]。"""
+        """Process mono float tensors at arbitrary sample rates."""
         wavs_16k = [self._resample(w, sr, 16000)
                     for w, sr in zip(wavs, sample_rates, strict=True)]
         wavs_24k = [self._resample(w, sr, 24000)
                     for w, sr in zip(wavs, sample_rates, strict=True)]
 
-        # s3tokenizer 批量（唯一真批量的前端模块）
+        # S3Tokenizer is the only frontend component with true batched inference.
         mels = [self._s3.log_mel_spectrogram(w) for w in wavs_16k]
         mels_pad, mels_lens = self._s3.padding(mels)
         tokens_pad, tokens_lens = self.audio_tokenizer.quantize(

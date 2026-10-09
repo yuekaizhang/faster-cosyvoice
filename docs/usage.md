@@ -74,7 +74,7 @@ curl http://127.0.0.1:8000/v1/audio/voices
 | `ref_audio` | data URI、HTTP(S) URL 或 server 本地路径 |
 | `ref_text` | 参考音频的准确文本 |
 | `response_format` | `wav` 或 `pcm`，默认 `wav` |
-| `stream` | 是否流式返回，默认 `false` |
+| `stream` | HTTP 是否分块返回，默认 `false`；不改变后端执行管线 |
 | `seed` | 采样随机种子，默认 `42` |
 
 使用已注册音色发送非流式请求：
@@ -91,6 +91,9 @@ curl http://127.0.0.1:8000/v1/audio/speech \
   }' \
   --output speech.wav
 ```
+
+这里的 `stream=false` 只表示服务端生成完整音频后再返回。LLM 与 Token2Wav 仍按流式
+chunk 执行；它不会切换到下文的静态 batch 离线推理路径。
 
 `response_format=pcm` 返回 raw little-endian PCM16；流式 WAV 使用 unknown-length
 WAV header。服务端固定输出 24 kHz 单声道音频。

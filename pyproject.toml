@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-faster-cosyvoice-server = "faster_cosyvoice.server.app:main"
+faster-cosyvoice-server = "faster_cosyvoice.server.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

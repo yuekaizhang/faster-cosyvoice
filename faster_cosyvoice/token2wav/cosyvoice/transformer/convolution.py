@@ -176,7 +176,7 @@ class CausalConv1d(torch.nn.Conv1d):
     def forward(self, x: torch.Tensor, cache: torch.Tensor = torch.zeros(0, 0, 0)) -> Tuple[torch.Tensor]:
         input_timestep = x.shape[2]
         if cache.size(2) == 0:
-            # [M3.5-r4] allocate on x's device directly: the original
+            # Allocate on x's device directly.  The original
             # `torch.zeros(...).to(x)` creates on CPU then does a pageable H2D
             # copy per call (sync overhead in eager, illegal under CUDA graph
             # capture — hift_graph.py captures this path). Numerics unchanged.
