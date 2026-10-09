@@ -134,9 +134,9 @@ uv run --frozen python examples/offline_inference.py \
 
 ### Streaming chunk 与 CUDA Graph
 
-推荐配置使用固定 25-token speech-token hop，并为 streaming Flow 和 HiFT 开启
-bucketed CUDA Graph。固定 hop 可以让请求 shape 更稳定，从而提高 graph bucket
-命中率。服务端只需添加一个开关，程序会使用内置且经过验证的两组 bucket：
+推荐配置使用默认的 `15 → 30 → 60…` speech-token hop，并为 streaming Flow 和
+HiFT 开启 bucketed CUDA Graph。服务端只需添加一个开关，程序会使用内置且经过
+验证的两组 bucket：
 
 ```bash
 --streaming-cuda-graph

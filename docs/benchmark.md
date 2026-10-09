@@ -62,7 +62,13 @@
 
 ![CosyVoice3 固定并发音频吞吐 RTFx](assets/cosyvoice3-fixed-concurrency-audio-xrt.svg)
 
-图中的空心点仍是实测值，但表示该并发档位未通过稳定性检查：至少有一个请求未完整返回、
-未产生可听音频、未成功结束，或客户端按实时速度模拟播放时耗尽了音频 buffer。这些点的 TTFP
-和 RTFx 可用于观察原始延迟与吞吐趋势，但不应视为能够稳定连续播放的服务容量。部分曲线较早结束，
-表示更高并发下没有产生可用的测试结果，而不是吞吐降为零。
+## Seed-TTS 中文 WER
+
+使用 Seed-TTS 中文测试集的 2,020 条样本检查 DSpark speculative decoding 是否影响
+生成质量。每条样本均使用各自配套的 `prompt_audio + prompt_text → target_text`，
+生成结果由 Paraformer 模型解码。
+
+| LLM 配置 | 样本数 | 字符错误数 | Character-WER / CER | ASR 完全匹配 | 生成失败 |
+|---|---:|---:|---:|---:|---:|
+| Target only（无 draft） | 2,020 | 490 | 1.1593% | 1,645（81.44%） | 0 |
+| Target + DSpark draft | 2,020 | **481** | **1.1380%** | **1,649（81.63%）** | 0 |

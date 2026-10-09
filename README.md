@@ -43,15 +43,14 @@ uv run --frozen faster-cosyvoice-server \
   --host 0.0.0.0 \
   --port 8000 \
   --speaker-encoder-tensorrt \
-  --speech-token-chunk-size 25 \
-  --speech-token-chunk-growth 1 \
   --streaming-cuda-graph
 ```
 
 LLM speculative decoding、FlashInfer DiT、跨请求 packed batching 和
 deadline-aware scheduler 是内置默认。上面的命令额外开启 speaker encoder
-TensorRT，将 streaming hop 固定为 25 个 speech token，并为 DiT 和 HiFT Vocoder
-开启 CUDA Graph。`--streaming-cuda-graph` 会使用内置且经过验证的 graph bucket，
+TensorRT，并为 DiT 和 HiFT Vocoder 开启 CUDA Graph。默认 streaming hop 从 15 个
+speech token 开始，随后按 `15 → 30 → 60…` 增长，与性能测试使用的首包策略一致。
+`--streaming-cuda-graph` 会使用内置且经过验证的 graph bucket，
 通常不需要手动配置；按请求长度分布调优 bucket 的方法见
 [高级配置](docs/usage.md#高级设置自定义-cuda-graph-bucket)。CUDA Graph、speaker
 encoder TensorRT 和 CUDA MPS 不会默认开启；MPS 需要在服务进程外单独启动。
