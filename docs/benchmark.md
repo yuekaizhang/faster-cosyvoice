@@ -1,7 +1,7 @@
 # Faster CosyVoice Benchmark
 
-本文记录 Faster CosyVoice 的性能指标、累积消融结果，以及与其他 CosyVoice3
-推理框架的固定并发对比。
+本文档记录 Faster CosyVoice 的性能指标、累积消融结果，以及与其他 CosyVoice3
+推理框架的性能对比。
 
 ## 指标与测试方法
 
@@ -16,42 +16,34 @@
 时间除以音频时长，越低越好；RTFx 是单位墙钟时间生成的音频时长，越高越好。
 
 固定并发 `C` 表示同时运行 `C` 个 worker；每个 worker 必须等待当前请求完整结束，
-才会发送下一条请求。因此，横轴表示持续存在的并发请求数，不等同于 open-loop 测试中
-的目标 RPS。
+才会发送下一条请求。因此，横轴表示持续存在的并发请求数。
+测试协议如下：
 
-除特别说明外，测试协议保持一致：
-
-- 单张 NVIDIA H100 80GB；
-- 固定注册音色；
-- 使用同一组确定性的 Seed-TTS evaluation text sequence；
+- 单张 NVIDIA Hopper GPU；
+- 固定参考音频和参考文本；
 - 15 秒 warmup，随后测量 60 秒；
 - seed 为 `0`；
-- leading-silence trim 关闭；
-- percentile 使用 nearest-rank 方法计算。
+- leading-silence trim 关闭。
 
 ## Faster CosyVoice 累积消融
 
-消融测试于 2026-09-02 完成，使用固定并发 C1。所有请求均完整返回、没有 underrun，
-实测首块音频长度均为 760 ms。A0–A6 关闭 MPS，A7 只在 A6 基础上开启 MPS；每一行
+消融测试统一使用单并发。所有请求均完整返回、没有 underrun，
+首块音频长度均为 760 ms。A0–A5 关闭 MPS，A6 只在 A5 基础上开启 MPS；每一行
 都包含此前步骤的全部优化。
 
 | Step | 累积配置 | TTFP p50 | TTFP p95 |
 |---|---|---:|---:|
 | A0 | vLLM target-only + Torch Flow | 318.8 ms | 392.9 ms |
-| A1 | A0 + DSpark speculative decoding | 267.4 ms | 325.3 ms |
-| A2 | A1 + FlashInfer Flow | 146.0 ms | 159.7 ms |
-| A3 | A2 + packed batching | 137.7 ms | 148.7 ms |
-| A4 | A3 + deadline-aware scheduler | 137.4 ms | 150.8 ms |
-| A5 | A4 + Flow CUDA Graph | 121.0 ms | 127.8 ms |
-| A6 | A5 + HiFT CUDA Graph | 106.5 ms | 113.3 ms |
-| A7 | A6 + CUDA MPS | **72.8 ms** | **82.0 ms** |
+| A1 | A0 + DSpark LLM | 267.4 ms | 325.3 ms |
+| A2 | A1 + FlashInfer DiT | 146.0 ms | 159.7 ms |
+| A3 | A2 + packed DiT batching | 137.7 ms | 148.7 ms |
+| A4 | A3 + DiT CUDA Graph | 121.0 ms | 127.8 ms |
+| A5 | A4 + HiFT CUDA Graph | 106.5 ms | 113.3 ms |
+| A6 | A5 + CUDA MPS | **72.8 ms** | **82.0 ms** |
 
-![Faster CosyVoice C1 TTFP 累积消融：p50 与 p95](assets/c1-ttfp-p50-p95.svg)
+![Faster CosyVoice 单并发 TTFP 累积消融：p50 与 p95](assets/c1-ttfp-p50-p95.svg)
 
-从 A0 到 A7，C1 TTFP p50 降低 77.2%，p95 降低 79.1%。这些增量依赖当前加入
-顺序和 workload，不能把每项优化的百分比独立相加。Deadline-aware scheduler 在稳定
-closed-loop C1 下的收益不明显；它主要用于 bursty 或 open-loop 流量下保护已经开始播放
-的 stream，降低尾延迟和 underrun 风险。
+从 A0 到 A6，单并发 TTFP p50 降低 77.2%，p95 降低 79.1%。
 
 ## 与其他框架对比
 
@@ -70,8 +62,7 @@ closed-loop C1 下的收益不明显；它主要用于 bursty 或 open-loop 流�
 
 ![CosyVoice3 固定并发音频吞吐 RTFx](assets/cosyvoice3-fixed-concurrency-audio-xrt.svg)
 
-Faster CosyVoice、Triton 和 vLLM-Omni 的对比数据将首块音频对齐为 760 ms。
-
-空心数据点表示该配置存在请求不完整、audibility/success 数量不一致，或模拟播放发生
-underrun。此类数据点的 RTFx 可以用于观察原始吞吐，但不应视为能够稳定连续播放的服务
-容量。部分曲线较早结束，是因为更高并发下没有得到有效测试结果。
+图中的空心点仍是实测值，但表示该并发档位未通过稳定性检查：至少有一个请求未完整返回、
+未产生可听音频、未成功结束，或客户端按实时速度模拟播放时耗尽了音频 buffer。这些点的 TTFP
+和 RTFx 可用于观察原始延迟与吞吐趋势，但不应视为能够稳定连续播放的服务容量。部分曲线较早结束，
+表示更高并发下没有产生可用的测试结果，而不是吞吐降为零。

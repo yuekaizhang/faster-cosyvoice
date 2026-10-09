@@ -4,7 +4,7 @@
 
 在线请求可以直接携带参考音频，也可以先在服务端注册音色，再通过名称复用。
 
-### 请求级 zero-shot voice clone
+### zero-shot voice clone
 
 `stream_client.py` 会将本地参考音频编码到当前请求中：
 
@@ -136,27 +136,48 @@ uv run --frozen python examples/offline_inference.py \
 
 推荐配置使用固定 25-token speech-token hop，并为 streaming Flow 和 HiFT 开启
 bucketed CUDA Graph。固定 hop 可以让请求 shape 更稳定，从而提高 graph bucket
-命中率。
+命中率。服务端只需添加一个开关，程序会使用内置且经过验证的两组 bucket：
+
+```bash
+--streaming-cuda-graph
+```
+
+离线 batch-size-1 Flow 也提供对应的一键开关：
+
+```bash
+--offline-flow-cuda-graph
+```
 
 `--speaker-encoder-tensorrt` 只影响未缓存参考音频的 frontend；已注册音色不会为每个
 请求重复运行 speaker encoder。Graph bucket 第一次命中时会 lazy capture，部署时应
 使用接近真实 shape 的请求预热。
 
-### CUDA Graph bucket
+### 高级设置：自定义 CUDA Graph bucket
+
+常规部署不需要指定 bucket。只有在请求时长分布明显不同、需要调整 padding 与显存
+占用时，才建议覆盖内置值。三组高级参数统一使用等效音频时长（秒），CLI 会在内部
+换算为 Mel frame。
+Speech token 的帧率约为 25 Hz，Mel 帧率为 50 Hz，即一个 Mel frame 为
+20 ms。因此 `1.28` 秒精确对应 64 个 Mel frame，这些小数是帧率换算的
+结果，而不是估算值。
 
 实际长度会向上 padding 到第一个足够大的 bucket；超过最大 bucket 时回退到 eager
-执行。Speech token 的帧率约为 25 Hz，Mel 帧率为 50 Hz，即一个 speech token
-对应约两个 Mel frame。因此，64 个 Mel frame 对应 1.28 秒，512 个 Mel frame 对应
-10.24 秒。
+执行。更密的 bucket 可减少 padding，但每个 bucket 都会增加 graph capture 时间和显存占用。
+一键开关采用下表的内置值；如果自定义，应根据实际请求的时长分布覆盖常见 shape，并让
+最大 bucket 覆盖预期的长请求。
+
+高级 bucket 参数可以单独使用，以便只开启对应模块的 CUDA Graph；也可以与一键开关
+组合。组合使用时，显式指定的 bucket 会覆盖对应模块的内置值，未指定的模块仍使用
+内置值。
 
 Flow bucket 覆盖包含 prompt 在内的完整上下文，还可能包含 lookahead 和 padding，
 不能直接视为新生成音频的时长。
 
-| 参数 | 单位 | 生效范围 |
+| 参数 | 时长含义 | 生效范围 |
 |---|---|---|
-| `--token2wav-cuda-graph-buckets 8,12,...` | 总音频秒数 | 离线 Flow，Token2Wav batch size 1 |
-| `--streaming-flow-graph-buckets 512,640,...` | Mel frame | 单 session streaming Flow |
-| `--streaming-vocoder-graph-buckets 64,128,...` | Mel frame | streaming 非末块 HiFT |
+| `--offline-flow-graph-bucket-seconds 8,12,16,20,24` | prompt + generated 的完整 Flow 上下文 | 离线 Flow，Token2Wav batch size 1 |
+| `--streaming-flow-graph-bucket-seconds 10.24,12.8,15.36,17.92,20.48,25.6` | prompt、padding、lookahead 和已消费 token 的完整 Flow 上下文 | 单 session streaming Flow |
+| `--streaming-vocoder-graph-bucket-seconds 1.28,2.56,3.84,5.12,7.68,10.24` | 当前输入 HiFT 的音频时长 | streaming 非末块 HiFT |
 
 ### Leading silence trim
 
@@ -178,8 +199,7 @@ Flow bucket 覆盖包含 prompt 在内的完整上下文，还可能包含 looka
 | `--token2wav-deadline-reserve-ms` | `100` | buffer 接近耗尽时的保护窗口 |
 | `--speech-token-chunk-size` | `15` | 第一个 streaming hop 的 token 数 |
 | `--speech-token-chunk-growth` | `2` | 后续 hop 的增长倍率；固定 shape 设为 `1` |
-| `--streaming-flow-graph-buckets` | 未设置 | streaming Flow CUDA Graph bucket |
-| `--streaming-vocoder-graph-buckets` | 未设置 | streaming HiFT CUDA Graph bucket |
+| `--streaming-cuda-graph` | 关闭 | 使用内置 bucket 开启 streaming Flow 与 HiFT CUDA Graph |
 | `--speaker-encoder-tensorrt` | 关闭 | 用 TensorRT 运行 CampPlus speaker encoder |
 | `--trim-leading-silence` | 关闭 | 修改开头 PCM，降低 audible TTFA |
 

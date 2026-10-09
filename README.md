@@ -2,38 +2,33 @@
 
 ## 项目介绍
 
-Faster CosyVoice 是面向 NVIDIA GPU 的 CosyVoice3 高性能推理与服务实现。项目支持
-CosyVoice3 的模型推理，围绕 speech-token LLM 与
-DiT Flow matching Token-to-Wav 两阶段推理链做系统优化，重点改善流式合成的首包延迟、并发吞吐和
-连续播放稳定性。
-
-这套实现不仅关注单个 kernel 的速度，也处理两个阶段共享一张 GPU 时产生的资源竞争、
-变长请求 padding 和流式任务调度问题。其中的大部分方法同样适用于其他
-“LLM + flow matching”两阶段 TTS 系统。
-
-![Faster CosyVoice architecture](docs/assets/readme/architecture.svg)
+Faster CosyVoice 是 [CosyVoice3](https://github.com/QwenAudio/CosyVoice) 语音合成模型的 GPU
+推理方案。针对 CosyVoice3 的 speech-token LLM 与 DiT Token-to-Wav 两阶段推理链，
+Faster CosyVoice 采用多种加速手段，大幅降低流式合成的首包延迟，并提升并发吞吐。
 
 主要加速手段包括：
 
 - **DSpark speculative decoding**：draft model 一次提出多个 speech token，由 target
   LLM 并行验证，减少自回归 decode step。
-- **FlashInfer DiT**：将 padded SDPA 改成 ragged attention，并融合 QKV、partial
-  RoPE 和 AdaLN 相关操作；流式路径使用 chunk-causal custom mask。
-- **跨请求 packed batching**：只拼接每条请求的有效 Mel frame，避免
+- **FlashInfer DiT**：使用 FlashInfer 算子库对 DiT 模型进行加速，包括将 padded SDPA
+  改成 ragged attention，并融合 QKV、partial RoPE 和 AdaLN 相关操作。
+- **跨请求 packed batching**：将不同请求拼成 batch 计算，只拼接每条请求的有效 Mel 声学特征，避免
   padding 带来的冗余计算。
-- **Deadline-aware scheduling**：实时跟踪每条 stream 还能播放多久；
-  即将耗尽的请求会优先调度，同时新请求的首 chunk 音频也会提高优先级处理。
-- **CUDA Graph**：对 Flow matching 和 HiFT 模块开启 CUDA Graph，减少 kernel launch 开销。
+- **Deadline-aware scheduling**：请求调度方面，实时跟踪每条 stream 还能播放多久；
+  即将耗尽的请求会优先调度，新到请求的首 chunk 音频也会高优处理。
+- **CUDA Graph**：对 DiT 和 HiFT Vocoder 模块开启 CUDA Graph，减少 kernel launch 开销。
 - **CUDA MPS**：让 vLLM EngineCore 与 token2wav worker 两个 CUDA 进程在同一张卡上
   更细粒度地交错执行，进一步提高 GPU 效率。
+
+这套实现不仅关注单个推理阶段的速度，也处理两个阶段共享 GPU 时产生的资源竞争、
+变长请求 padding 和流式任务调度等问题。该实现也可以为其他
+“LLM + flow matching”两阶段 TTS 系统提供参考。
+
+![Faster CosyVoice architecture](docs/assets/readme/architecture.svg)
 
 ## 快速开始
 
 ### 1. 安装
-
-需要 Linux x86_64、CUDA 13 兼容驱动、Python 3.12 和
-[uv](https://docs.astral.sh/uv/)。Debian/Ubuntu 容器需要预装
-`build-essential libsndfile1 sox`。
 
 ```bash
 git clone https://github.com/yuekaizhang/faster-cosyvoice.git
@@ -50,17 +45,18 @@ uv run --frozen faster-cosyvoice-server \
   --speaker-encoder-tensorrt \
   --speech-token-chunk-size 25 \
   --speech-token-chunk-growth 1 \
-  --streaming-flow-graph-buckets 512,640,768,896,1024,1280 \
-  --streaming-vocoder-graph-buckets 64,128,192,256,384,512
+  --streaming-cuda-graph
 ```
 
-推荐部署配置：开启 LLM Speculative Decoding、FlashInfer Flow Matching、跨请求 packed batching、
-deadline-aware scheduler、Flow/HiFT CUDA Graph 和 speaker encoder TensorRT。
-CUDA MPS 需要单独在服务进程外启动。
+LLM speculative decoding、FlashInfer DiT、跨请求 packed batching 和
+deadline-aware scheduler 是内置默认。上面的命令额外开启 speaker encoder
+TensorRT，将 streaming hop 固定为 25 个 speech token，并为 DiT 和 HiFT Vocoder
+开启 CUDA Graph。`--streaming-cuda-graph` 会使用内置且经过验证的 graph bucket，
+通常不需要手动配置；按请求长度分布调优 bucket 的方法见
+[高级配置](docs/usage.md#高级设置自定义-cuda-graph-bucket)。CUDA Graph、speaker
+encoder TensorRT 和 CUDA MPS 不会默认开启；MPS 需要在服务进程外单独启动。
 
 ### 3. 发送流式请求
-
-下面的请求直接携带参考音频，不需要提前注册音色：
 
 ```bash
 uv run --frozen python examples/stream_client.py \
@@ -82,8 +78,11 @@ uv run --frozen python examples/offline_inference.py \
 
 ### 5. 进一步加速：开启 CUDA MPS
 
-默认服务会产生 vLLM EngineCore 和 token2wav worker 两个 CUDA client。同卡部署时
-可以在启动服务前开启 MPS：
+服务启动以后会产生 vLLM EngineCore 和 token2wav worker 两个 CUDA client。同卡部署时
+两个独立 CUDA context 的 kernel 容易在较粗的调度边界串行，造成 GPU 空泡。CUDA
+MPS 将多进程工作提交给共享的 GPU 调度服务，使 LLM 和 token2wav 的 kernel 能够更细
+粒度地交错或并行执行，从而填补空泡、提高整卡利用率。MPS 不会让单个 kernel 本身变快，
+实际收益取决于两阶段是否有可重叠的计算。可以在启动服务前开启 MPS：
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
@@ -94,7 +93,7 @@ mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
 nvidia-cuda-mps-control -d
 ```
 
-MPS daemon 启动后，在同一个 shell 中执行上文第 2 节介绍的服务启动命令。服务退出后关闭
+MPS daemon 启动后，在同一个 shell 中执行上文介绍的服务启动命令。服务退出后关闭
 daemon：
 
 ```bash
@@ -105,8 +104,8 @@ echo quit | nvidia-cuda-mps-control
 
 ## 性能
 
-下表来自单张 H100 80GB 上的固定并发测试。所有配置使用固定注册音色、同一组
-Seed-TTS 文本和 760 ms 首块音频；测试前 warmup 15 秒，measurement 窗口 60 秒。
+下表来自单张 Hopper GPU 上的固定并发测试。所有配置使用固定注册音色、同一组
+参考文本和相同长度首包音频；测试前 warmup 15 秒，measurement 窗口 60 秒。
 
 | 配置 | 并发 | TTFP p50 | TTFP p95 | Audio RTFx |
 |---|---:|---:|---:|---:|

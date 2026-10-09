@@ -152,7 +152,7 @@ class FlashInferDiT(nn.Module):
         self.out_channels = out_channels
         self.enable_cuda_graph = enable_cuda_graph
         self.cuda_graph_buckets = (
-            sorted(int(duration * _MEL_FRAMES_PER_SECOND) for duration in cuda_graph_buckets)
+            sorted(round(duration * _MEL_FRAMES_PER_SECOND) for duration in cuda_graph_buckets)
             if cuda_graph_buckets
             else None
         )

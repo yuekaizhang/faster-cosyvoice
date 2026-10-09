@@ -26,7 +26,12 @@ import soundfile as sf
 import torch
 
 from faster_cosyvoice.assets import ensure_token2wav_assets
-from faster_cosyvoice.config import LLMConfig, Token2WavConfig
+from faster_cosyvoice.cli import parse_duration_bucket_seconds
+from faster_cosyvoice.config import (
+    DEFAULT_OFFLINE_FLOW_GRAPH_BUCKET_SECONDS,
+    LLMConfig,
+    Token2WavConfig,
+)
 from faster_cosyvoice.envcheck import check_environment
 from faster_cosyvoice.llm.engine import (
     create_offline_llm,
@@ -64,13 +69,31 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p.add_argument("--token2wav-batch-size", type=int, default=8)
     p.add_argument("--token2wav-device", default="cuda:0",
                    help="Device for token2wav and the reference-audio frontend.")
-    p.add_argument("--token2wav-cuda-graph-buckets", default=None,
-                   help="Comma-separated total-duration buckets in seconds "
-                        "(reference plus generated audio), for example "
-                        "8,12,16,20,24. Used by offline batch-size-1 Flow.")
-    p.add_argument("--t2w-cuda-graph-buckets",
-                   dest="token2wav_cuda_graph_buckets",
-                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--offline-flow-cuda-graph",
+        action="store_true",
+        help="Enable offline batch-size-1 Flow CUDA Graph with built-in "
+             "bucket presets. Use --offline-flow-graph-bucket-seconds only "
+             "for advanced tuning.",
+    )
+    flow_graph_group = p.add_mutually_exclusive_group()
+    flow_graph_group.add_argument(
+        "--offline-flow-graph-bucket-seconds",
+        dest="offline_flow_graph_duration_buckets",
+        type=parse_duration_bucket_seconds,
+        metavar="SECONDS",
+        default=None,
+        help="Comma-separated total-context duration buckets in seconds for "
+             "offline batch-size-1 Flow CUDA Graph, for example 8,12,16,20,24.",
+    )
+    flow_graph_group.add_argument(
+        "--token2wav-cuda-graph-buckets",
+        "--t2w-cuda-graph-buckets",
+        dest="offline_flow_graph_duration_buckets",
+        type=parse_duration_bucket_seconds,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--speaker-encoder-tensorrt", action="store_true",
                    help="Run the CampPlus speaker encoder with TensorRT "
                         "instead of ONNX Runtime CPU.")
@@ -89,6 +112,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 def get_args(argv=None):
     return build_argument_parser().parse_args(argv)
+
+
+def resolve_offline_flow_graph_buckets(
+    args: argparse.Namespace,
+) -> tuple[float, ...] | None:
+    """Use explicit offline buckets when provided, otherwise the preset."""
+    if args.offline_flow_graph_duration_buckets is not None:
+        return args.offline_flow_graph_duration_buckets
+    if args.offline_flow_cuda_graph:
+        return DEFAULT_OFFLINE_FLOW_GRAPH_BUCKET_SECONDS
+    return None
 
 
 def load_items(args):
@@ -141,13 +175,13 @@ def main():
     args = get_args()
     draft = None if args.draft_model in (None, "none") else args.draft_model
     llm_cfg = LLMConfig(target_model=args.target_model, draft_model=draft)
+    flow_graph_buckets = resolve_offline_flow_graph_buckets(args)
     token2wav_cfg = Token2WavConfig(
         model_dir=args.token2wav_dir,
         device=args.token2wav_device,
         estimator_mode=args.flow_estimator,
         batch_size=args.token2wav_batch_size,
-        offline_flow_graph_duration_buckets=(
-            args.token2wav_cuda_graph_buckets),
+        offline_flow_graph_duration_buckets=flow_graph_buckets,
         vocoder_compile=args.vocoder_compile,
     )
 
@@ -195,12 +229,11 @@ def main():
     frontend = RefAudioFrontend(f"{model_dir}/campplus.onnx",
                                 device=token2wav_cfg.device,
                                 campplus_trt=args.speaker_encoder_tensorrt)
-    buckets = ([float(s) for s in
-                token2wav_cfg.offline_flow_graph_duration_buckets.split(",")]
-               if token2wav_cfg.offline_flow_graph_duration_buckets else None)
     token2wav = CosyVoice3Token2Wav(model_dir, device=token2wav_cfg.device,
                                     estimator_mode=token2wav_cfg.estimator_mode,
-                                    cuda_graph_buckets=buckets,
+                                    cuda_graph_buckets=(
+                                        token2wav_cfg
+                                        .offline_flow_graph_duration_buckets),
                                     hift_compile=token2wav_cfg.vocoder_compile)
 
     metrics = dict(llm_wall_s=0.0, token2wav_wall_s=0.0,

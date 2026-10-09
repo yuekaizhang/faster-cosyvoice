@@ -3,6 +3,13 @@
 from dataclasses import dataclass
 from typing import Optional
 
+# CUDA Graph presets used by the simple enable switches.  The CLI exposes
+# durations in seconds for manual tuning, while the streaming runtime stores
+# its buckets in 50 Hz Mel frames.
+DEFAULT_OFFLINE_FLOW_GRAPH_BUCKET_SECONDS = (8.0, 12.0, 16.0, 20.0, 24.0)
+DEFAULT_STREAMING_FLOW_GRAPH_BUCKETS = (512, 640, 768, 896, 1024, 1280)
+DEFAULT_STREAMING_VOCODER_GRAPH_BUCKETS = (64, 128, 192, 256, 384, 512)
+
 
 @dataclass
 class LLMConfig:
@@ -34,11 +41,11 @@ class Token2WavConfig:
 
     # Offline Flow graph buckets are total prompt + generated audio duration
     # in seconds.  Only token2wav batches of one use this graph path.
-    offline_flow_graph_duration_buckets: Optional[str] = None
+    offline_flow_graph_duration_buckets: Optional[tuple[float, ...]] = None
 
     # Streaming Flow graph buckets are full sequence lengths in Mel frames.
     # The sequence contains prompt, first-chunk padding, and consumed tokens.
-    streaming_flow_graph_buckets: Optional[str] = None
+    streaming_flow_graph_buckets: Optional[tuple[int, ...]] = None
 
     # torch.compile the HiFT vocoder and round offline Mel lengths up to the
     # implementation's 64-frame buckets.
@@ -46,7 +53,7 @@ class Token2WavConfig:
 
     # Streaming HiFT CUDA Graph input lengths in Mel frames.  They apply only
     # to non-final chunks; final and overlong chunks use the eager path.
-    streaming_vocoder_graph_buckets: Optional[str] = None
+    streaming_vocoder_graph_buckets: Optional[tuple[int, ...]] = None
 
     # Use TensorRT for the CampPlus speaker encoder instead of ONNX Runtime CPU.
     speaker_encoder_tensorrt: bool = False

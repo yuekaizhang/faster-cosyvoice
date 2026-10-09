@@ -17,7 +17,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
 
 from faster_cosyvoice.assets import ensure_token2wav_assets
-from faster_cosyvoice.config import LLMConfig, ServerConfig, Token2WavConfig
+from faster_cosyvoice.cli import (
+    parse_mel_duration_bucket_seconds,
+    parse_mel_frame_buckets,
+)
+from faster_cosyvoice.config import (
+    DEFAULT_STREAMING_FLOW_GRAPH_BUCKETS,
+    DEFAULT_STREAMING_VOCODER_GRAPH_BUCKETS,
+    LLMConfig,
+    ServerConfig,
+    Token2WavConfig,
+)
 from faster_cosyvoice.envcheck import check_environment
 from faster_cosyvoice.llm.engine import create_async_llm
 from faster_cosyvoice.llm.tokens import SpeechTokenCodec
@@ -64,18 +74,12 @@ def build_app(llm_cfg: LLMConfig, token2wav_cfg: Token2WavConfig,
                                           campplus_trt=(
                                               token2wav_cfg
                                               .speaker_encoder_tensorrt))
-        stream_buckets = ([int(v) for v in
-                           token2wav_cfg.streaming_flow_graph_buckets.split(",")]
-                          if token2wav_cfg.streaming_flow_graph_buckets else None)
-        hift_buckets = ([int(v) for v in
-                         token2wav_cfg.streaming_vocoder_graph_buckets.split(",")]
-                        if token2wav_cfg.streaming_vocoder_graph_buckets else None)
         state.token2wav = CosyVoice3Token2Wav(
             model_dir, device=token2wav_cfg.device,
             estimator_mode=token2wav_cfg.estimator_mode,
             hift_compile=token2wav_cfg.vocoder_compile,
-            stream_graph_buckets=stream_buckets,
-            hift_graph_buckets=hift_buckets)
+            stream_graph_buckets=token2wav_cfg.streaming_flow_graph_buckets,
+            hift_graph_buckets=token2wav_cfg.streaming_vocoder_graph_buckets)
         state.batcher = Token2WavWorker(state.token2wav,
                                         mode=token2wav_cfg.batch_mode,
                                         max_batch=token2wav_cfg.batch_size,
@@ -243,20 +247,51 @@ def build_argument_parser() -> argparse.ArgumentParser:
                         "of one-time startup warmup.")
     p.add_argument("--hift-compile", dest="vocoder_compile", action="store_true",
                    default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    p.add_argument("--streaming-flow-graph-buckets", default=None,
-                   help="Comma-separated streaming Flow sequence-length "
-                        "buckets in Mel frames, for example "
-                        "512,640,768,896,1024,1280. Single-session only.")
-    p.add_argument("--stream-graph-buckets",
-                   dest="streaming_flow_graph_buckets",
-                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    p.add_argument("--streaming-vocoder-graph-buckets", default=None,
-                   help="Comma-separated streaming vocoder input buckets in "
-                        "Mel frames, for example 64,128,192,256,384,512. "
-                        "Applies to non-final chunks only.")
-    p.add_argument("--hift-graph-buckets",
-                   dest="streaming_vocoder_graph_buckets",
-                   default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--streaming-cuda-graph",
+        action="store_true",
+        help="Enable streaming Flow and HiFT CUDA Graphs with built-in "
+             "bucket presets. Use the per-module bucket options only for "
+             "advanced tuning.",
+    )
+    flow_graph_group = p.add_mutually_exclusive_group()
+    flow_graph_group.add_argument(
+        "--streaming-flow-graph-bucket-seconds",
+        dest="streaming_flow_graph_buckets",
+        type=parse_mel_duration_bucket_seconds,
+        metavar="SECONDS",
+        default=None,
+        help="Comma-separated full-context duration buckets in seconds for "
+             "single-session streaming Flow CUDA Graph, for example "
+             "10.24,12.8,15.36,17.92,20.48,25.6.",
+    )
+    flow_graph_group.add_argument(
+        "--streaming-flow-graph-buckets",
+        "--stream-graph-buckets",
+        dest="streaming_flow_graph_buckets",
+        type=parse_mel_frame_buckets,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    vocoder_graph_group = p.add_mutually_exclusive_group()
+    vocoder_graph_group.add_argument(
+        "--streaming-vocoder-graph-bucket-seconds",
+        dest="streaming_vocoder_graph_buckets",
+        type=parse_mel_duration_bucket_seconds,
+        metavar="SECONDS",
+        default=None,
+        help="Comma-separated input-audio duration buckets in seconds for "
+             "streaming HiFT CUDA Graph, for example "
+             "1.28,2.56,3.84,5.12,7.68,10.24. Non-final chunks only.",
+    )
+    vocoder_graph_group.add_argument(
+        "--streaming-vocoder-graph-buckets",
+        "--hift-graph-buckets",
+        dest="streaming_vocoder_graph_buckets",
+        type=parse_mel_frame_buckets,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--speech-token-chunk-size", type=int, default=15,
                    help="Speech tokens consumed by the first streaming hop "
                         "(default: 15; use 25 for fixed-shape graph mode).")
@@ -287,6 +322,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return p
 
 
+def resolve_streaming_graph_buckets(
+    args: argparse.Namespace,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    """Apply built-in graph presets without overriding explicit bucket tuning."""
+    flow_buckets = args.streaming_flow_graph_buckets
+    vocoder_buckets = args.streaming_vocoder_graph_buckets
+    if args.streaming_cuda_graph:
+        if flow_buckets is None:
+            flow_buckets = DEFAULT_STREAMING_FLOW_GRAPH_BUCKETS
+        if vocoder_buckets is None:
+            vocoder_buckets = DEFAULT_STREAMING_VOCODER_GRAPH_BUCKETS
+    return flow_buckets, vocoder_buckets
+
+
 def main():
     args = build_argument_parser().parse_args()
     if (args.token2wav_batch_mode == "packed"
@@ -308,6 +357,9 @@ def main():
     import os
     os.environ.setdefault("OMP_NUM_THREADS", "1")  # 同 offline 的 fork segfault 规避
     draft = None if args.draft_model in (None, "none") else args.draft_model
+    flow_graph_buckets, vocoder_graph_buckets = (
+        resolve_streaming_graph_buckets(args)
+    )
     llm_cfg = LLMConfig(target_model=args.target_model, draft_model=draft,
                         gpu_memory_utilization=args.gpu_memory_utilization)
     token2wav_cfg = Token2WavConfig(
@@ -320,8 +372,8 @@ def main():
         deadline_reserve_s=args.token2wav_deadline_reserve_ms / 1000,
         vocoder_compile=args.vocoder_compile,
         speaker_encoder_tensorrt=args.speaker_encoder_tensorrt,
-        streaming_flow_graph_buckets=args.streaming_flow_graph_buckets,
-        streaming_vocoder_graph_buckets=args.streaming_vocoder_graph_buckets,
+        streaming_flow_graph_buckets=flow_graph_buckets,
+        streaming_vocoder_graph_buckets=vocoder_graph_buckets,
     )
     server_cfg = ServerConfig(host=args.host, port=args.port,
                               gpu_memory_utilization=args.gpu_memory_utilization,
